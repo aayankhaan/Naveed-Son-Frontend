@@ -8,7 +8,7 @@ import { COLORS } from "../../constants/theme";
 export function Logo({ size = 34 }) {
   return (
     <svg width={size} height={size} viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
-      <rect x="1" y="1" width="46" height="46" rx="10" fill={COLORS.ink} />
+      <rect x="1" y="1" width="46" height="46" rx="10" fill={COLORS.inkSurface} />
       <rect x="1" y="1" width="46" height="46" rx="10" stroke={COLORS.gold} strokeWidth="1.2" />
       <rect x="12" y="27" width="24" height="6" rx="2" fill={COLORS.graphiteLight} opacity="0.35" />
       <rect x="12.5" y="21.5" width="23" height="6" rx="2" fill={COLORS.boneDim} opacity="0.55" />
@@ -53,6 +53,13 @@ export function NavIcon({ name }) {
           <path d="M9 5.5v7M6.8 7.2c0-1 .9-1.7 2.2-1.7s2.2.6 2.2 1.5c0 2.2-4.4 1-4.4 3.2 0 .9 1 1.5 2.2 1.5s2.2-.6 2.2-1.5" stroke={stroke} strokeWidth="1.2" strokeLinecap="round" />
         </svg>
       );
+    case "shipment":
+      return (
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+          <path d="M2.5 11.5V6.2L9 3l6.5 3.2v5.3L9 15l-6.5-3.5z" stroke="currentColor" strokeWidth="1.35" strokeLinejoin="round" />
+          <path d="M2.5 6.2L9 9.4l6.5-3.2M9 9.4V15" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      );
     case "invoicing":
       return (
         <svg {...common}>
@@ -81,11 +88,12 @@ export function NavIcon({ name }) {
           <path d="M6 5.5h6M6 8.5h6M6 11.5h4" stroke={stroke} strokeWidth="1.3" strokeLinecap="round" />
         </svg>
       );
-    case "reports":
+    case "expenses":
       return (
         <svg {...common}>
-          <path d="M3 2.5h12v13H3v-13z" stroke={stroke} strokeWidth="1.4" rx="1.2" />
-          <path d="M6 6h6M6 9h6M6 12h4" stroke={stroke} strokeWidth="1.3" strokeLinecap="round" />
+          <rect x="3" y="4" width="12" height="10" rx="1.5" stroke={stroke} strokeWidth="1.4" />
+          <path d="M3 7.5h12M7 4v3.5" stroke={stroke} strokeWidth="1.3" strokeLinecap="round" />
+          <path d="M8.5 11h3" stroke={stroke} strokeWidth="1.3" strokeLinecap="round" />
         </svg>
       );
     default:

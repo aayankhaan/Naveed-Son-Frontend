@@ -10,7 +10,7 @@ import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend
 } from "recharts";
 import { FONT, COLORS } from "../constants/theme";
-import Sidebar from "../components/layout/Sidebar";
+import AppShell from "../components/layout/AppShell";
 import MiniStat from "../components/ui/MiniStat";
 import { SearchIcon } from "../components/icons/CommonIcons";
 
@@ -141,7 +141,6 @@ function StatusBadge({ status }) {
 }
 
 export default function ForecastPage() {
-  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [horizonDays, setHorizonDays] = useState(15);
   const [search, setSearch] = useState("");
 
@@ -163,46 +162,25 @@ export default function ForecastPage() {
   }, [search]);
 
   return (
-    <div className="min-h-screen w-full flex" style={{ background: COLORS.bone, fontFamily: FONT }}>
-      <Sidebar mobileOpen={mobileNavOpen} onClose={() => setMobileNavOpen(false)} />
-
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center justify-between gap-3 px-5 md:px-8 py-4 sticky top-0 z-30 backdrop-blur" style={{ background: `${COLORS.bone}F2`, borderBottom: `1px solid ${COLORS.border}` }}>
-          <div className="flex items-center gap-3 min-w-0">
-            <button type="button" className="md:hidden p-2 rounded-lg btn-secondary shrink-0" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }} onClick={() => setMobileNavOpen(true)} aria-label="Open navigation">
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M2 4h12M2 8h12M2 12h12" stroke={COLORS.ink} strokeWidth="1.4" strokeLinecap="round" />
-              </svg>
-            </button>
-            <div className="min-w-0">
-              <h1 className="text-xl font-semibold truncate" style={{ color: COLORS.ink }}>Production Forecast &amp; Output Estimates</h1>
-              <p className="text-[12px]" style={{ color: COLORS.graphiteLight }}>Predictive output estimates based on historical station velocity</p>
-            </div>
-          </div>
-          <div className="flex items-center gap-3 shrink-0">
-            <div className="select-wrap">
-              <select value={horizonDays} onChange={(e) => setHorizonDays(Number(e.target.value))}>
-                <option value={7}>Next 7 Days</option>
-                <option value={15}>Next 15 Days (Pay Cycle)</option>
-                <option value={30}>Next 30 Days</option>
-                <option value={90}>Next Quarter (90 Days)</option>
-              </select>
-              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="select-caret">
-                <path d="M2.5 4.5L6 8l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            </div>
-            <div className="hidden sm:flex flex-col items-end leading-tight border-l pl-3" style={{ borderColor: COLORS.border }}>
-              <span className="text-[13px] font-medium" style={{ color: COLORS.ink }}>Admin</span>
-              <span className="text-[11px]" style={{ color: COLORS.graphiteLight }}>Administrator</span>
-            </div>
-            <div className="w-9 h-9 rounded-full flex items-center justify-center text-[13px] font-semibold shrink-0" style={{ background: COLORS.ink, color: COLORS.gold, border: `2px solid ${COLORS.goldSoft}` }}>
-              A
-            </div>
-          </div>
+    <AppShell
+      title="Forecast"
+      subtitle="Output estimates from historical station velocity"
+      maxWidth="80rem"
+      actions={
+        <div className="select-wrap">
+          <select value={horizonDays} onChange={(e) => setHorizonDays(Number(e.target.value))}>
+            <option value={7}>Next 7 Days</option>
+            <option value={15}>Next 15 Days (Pay Cycle)</option>
+            <option value={30}>Next 30 Days</option>
+            <option value={90}>Next Quarter (90 Days)</option>
+          </select>
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="select-caret">
+            <path d="M2.5 4.5L6 8l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
         </div>
-
-        <div className="p-5 md:p-8 max-w-7xl mx-auto">
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+      }
+    >
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 mb-6">
             <MiniStat index={0} icon={<TrendingIcon />} label={`Predicted Output (${horizonDays}d)`} value={`${projectedTotalUnits.toLocaleString()} units`} sub="+14.2% projected increase" />
             <MiniStat index={1} icon={<BanknoteIcon />} label="Expected Contract Revenue" value={formatPKR(projectedRevenue)} sub="based on unit rates" />
             <MiniStat index={2} icon={<GaugeIcon />} label="Bottleneck Station" value="Stitching" sub="94% projected capacity" />
@@ -243,7 +221,7 @@ export default function ForecastPage() {
                     <XAxis dataKey="day" tick={{ fontSize: 11, fill: COLORS.graphiteLight }} axisLine={{ stroke: COLORS.border }} tickLine={false} />
                     <YAxis tick={{ fontSize: 11, fill: COLORS.graphiteLight }} axisLine={false} tickLine={false} />
                     <Tooltip
-                      contentStyle={{ background: COLORS.ink, border: "none", borderRadius: 10, fontSize: 12, padding: "8px 12px" }}
+                      contentStyle={{ background: COLORS.inkSurface, border: "none", borderRadius: 10, fontSize: 12, padding: "8px 12px" }}
                       labelStyle={{ color: COLORS.bone }}
                       formatter={(value, name) => [value ? `${value.toLocaleString()} units` : "—", name === "actual" ? "Actual Output" : "Forecasted Output"]}
                     />
@@ -350,8 +328,6 @@ export default function ForecastPage() {
               </table>
             </div>
           </div>
-        </div>
-      </div>
 
       <style>{`
         * { box-sizing: border-box; }
@@ -396,6 +372,6 @@ export default function ForecastPage() {
         ::-webkit-scrollbar-thumb { background: ${COLORS.boneBorder}; border-radius: 8px; }
         ::-webkit-scrollbar-thumb:hover { background: ${COLORS.graphiteLight}; }
       `}</style>
-    </div>
+    </AppShell>
   );
 }

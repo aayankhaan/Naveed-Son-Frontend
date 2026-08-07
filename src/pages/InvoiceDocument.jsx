@@ -1,93 +1,98 @@
 // ========================================
 // InvoiceDocument.jsx
-// Pure @react-pdf/renderer recreation of the on-screen invoice preview in
-// Orders.jsx. Presentational only — receives plain data via props and
-// renders a real, selectable PDF (no DOM capture or rasterization).
+// Matches the printed Naveed & Sons bill form:
+// header · billing boxes · line table · Sub Total · empty space · signatures at foot.
 // ========================================
 
 import { Document, Page, View, Text, StyleSheet } from "@react-pdf/renderer";
 
+const MIN_ROWS = 20;
+
 const styles = StyleSheet.create({
   page: {
-    padding: 28,
+    paddingTop: 28,
+    paddingHorizontal: 28,
+    paddingBottom: 28,
     fontSize: 9.5,
     fontFamily: "Helvetica",
     color: "#000000",
+    flexDirection: "column",
   },
 
   titleBox: {
     border: "1.5pt solid #000000",
-    borderRadius: 4,
-    paddingVertical: 8,
+    borderRadius: 3,
+    paddingVertical: 10,
     paddingHorizontal: 8,
-    marginBottom: 12,
+    marginBottom: 14,
   },
   title: {
     fontFamily: "Helvetica-Bold",
     fontSize: 16,
-    letterSpacing: 1,
+    letterSpacing: 1.2,
     textAlign: "center",
   },
 
   billRow: {
     flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
+    alignItems: "flex-end",
+    gap: 6,
     marginBottom: 12,
   },
   billLabel: {
     fontFamily: "Helvetica-Bold",
-    fontSize: 9.5,
+    fontSize: 10,
   },
-  billBox: {
-    border: "1pt solid #000000",
-    borderRadius: 3,
-    paddingVertical: 3,
-    paddingHorizontal: 10,
+  billLine: {
+    borderBottom: "1pt solid #000000",
+    minWidth: 72,
+    paddingBottom: 1,
+    paddingHorizontal: 4,
   },
   billValue: {
     fontFamily: "Helvetica-Bold",
-    fontSize: 9.5,
-    textAlign: "center",
+    fontSize: 11,
   },
 
   detailsRow: {
     flexDirection: "row",
-    gap: 12,
+    gap: 10,
     marginBottom: 12,
   },
   detailsBox: {
     flex: 1,
     border: "1pt solid #000000",
-    borderRadius: 4,
+    borderRadius: 3,
     padding: 8,
+    minHeight: 88,
   },
   detailsHeading: {
     fontFamily: "Helvetica-Bold",
     fontSize: 9.5,
     textAlign: "center",
-    marginBottom: 6,
+    marginBottom: 8,
   },
   fieldRow: {
     flexDirection: "row",
-    marginBottom: 5,
+    marginBottom: 7,
+    alignItems: "flex-end",
   },
   fieldLabel: {
     fontFamily: "Helvetica-Bold",
     fontSize: 9,
-    width: 62,
+    width: 68,
   },
   fieldValue: {
     flex: 1,
     fontSize: 9,
     borderBottom: "0.75pt solid #000000",
-    paddingBottom: 1.5,
+    paddingBottom: 1,
+    minHeight: 11,
   },
 
   table: {
     border: "1pt solid #000000",
-    borderRadius: 4,
-    marginBottom: 24,
+    borderRadius: 3,
   },
   tr: {
     flexDirection: "row",
@@ -95,48 +100,74 @@ const styles = StyleSheet.create({
   th: {
     fontFamily: "Helvetica-Bold",
     fontSize: 9,
-    padding: 5,
+    paddingVertical: 5,
+    paddingHorizontal: 4,
     borderRight: "1pt solid #000000",
     borderBottom: "1pt solid #000000",
+    textAlign: "center",
   },
   td: {
     fontSize: 9,
-    padding: 5,
+    paddingVertical: 6,
+    paddingHorizontal: 4,
     borderRight: "1pt solid #000000",
     borderBottom: "1pt solid #000000",
+    minHeight: 22,
   },
   tdLast: {
     fontSize: 9,
-    padding: 5,
+    paddingVertical: 6,
+    paddingHorizontal: 4,
     borderBottom: "1pt solid #000000",
+    minHeight: 22,
+  },
+  tdEmpty: {
+    fontSize: 9,
+    paddingVertical: 6,
+    paddingHorizontal: 4,
+    borderRight: "1pt solid #000000",
+    borderBottom: "1pt solid #000000",
+    minHeight: 22,
+    color: "#000000",
   },
   colSr: { width: "8%", textAlign: "center" },
-  colDescription: { width: "28%" },
-  colDesign: { width: "22%" },
-  colQty: { width: "14%", textAlign: "right" },
-  colRate: { width: "14%", textAlign: "right" },
-  colAmount: { width: "14%", textAlign: "right", borderRight: "none" },
+  colDescription: { width: "32%" },
+  colDesign: { width: "20%" },
+  colQty: { width: "12%", textAlign: "right" },
+  colRate: { width: "13%", textAlign: "right" },
+  colAmount: { width: "15%", textAlign: "right", borderRight: "none" },
+  designLine: { fontSize: 9, marginBottom: 1 },
 
+  subTotalRow: {
+    flexDirection: "row",
+  },
   subTotalLabel: {
     fontFamily: "Helvetica-Bold",
-    fontSize: 9.5,
+    fontSize: 10,
     textAlign: "right",
-    padding: 6,
-    width: "86%",
+    paddingVertical: 7,
+    paddingHorizontal: 6,
+    width: "85%",
     borderRight: "1pt solid #000000",
   },
   subTotalValue: {
     fontFamily: "Helvetica-Bold",
-    fontSize: 9.5,
+    fontSize: 10,
     textAlign: "right",
-    padding: 6,
-    width: "14%",
+    paddingVertical: 7,
+    paddingHorizontal: 6,
+    width: "15%",
+  },
+
+  spacer: {
+    flexGrow: 1,
+    minHeight: 48,
   },
 
   signatureRow: {
     flexDirection: "row",
     justifyContent: "space-between",
-    marginTop: 32,
+    marginTop: 8,
   },
   signatureBlock: {
     width: "22%",
@@ -158,7 +189,20 @@ function InvoiceField({ label, value }) {
   return (
     <View style={styles.fieldRow}>
       <Text style={styles.fieldLabel}>{label}:</Text>
-      <Text style={styles.fieldValue}>{value || ""}</Text>
+      <Text style={styles.fieldValue}>{value || " "}</Text>
+    </View>
+  );
+}
+
+function EmptyRow({ sr }) {
+  return (
+    <View style={styles.tr} wrap={false}>
+      <Text style={[styles.tdEmpty, styles.colSr]}>{sr}</Text>
+      <Text style={[styles.tdEmpty, styles.colDescription]}> </Text>
+      <Text style={[styles.tdEmpty, styles.colDesign]}> </Text>
+      <Text style={[styles.tdEmpty, styles.colQty]}> </Text>
+      <Text style={[styles.tdEmpty, styles.colRate]}> </Text>
+      <Text style={[styles.tdLast, styles.colAmount]}> </Text>
     </View>
   );
 }
@@ -175,6 +219,9 @@ export default function InvoiceDocument({
   rows = [],
   subTotal = 0,
 }) {
+  const filled = Array.isArray(rows) ? rows : [];
+  const emptyCount = Math.max(0, MIN_ROWS - filled.length);
+
   return (
     <Document>
       <Page size="A4" style={styles.page}>
@@ -184,8 +231,8 @@ export default function InvoiceDocument({
 
         <View style={styles.billRow}>
           <Text style={styles.billLabel}>Bill No.</Text>
-          <View style={styles.billBox}>
-            <Text style={styles.billValue}>{billNo}</Text>
+          <View style={styles.billLine}>
+            <Text style={styles.billValue}>{billNo || " "}</Text>
           </View>
         </View>
 
@@ -215,26 +262,52 @@ export default function InvoiceDocument({
             <Text style={[styles.th, styles.colAmount]}>Amount</Text>
           </View>
 
-          {rows.map((row, i) => {
-            const qty = Number(row.qty) || 0;
+          {filled.map((row, i) => {
+            const qtyOrdered = Number(row.qtyOrdered ?? row.qty) || 0;
             const rate = Number(row.rate) || 0;
+            const designLines = row.designLines?.length
+              ? row.designLines
+              : String(row.design || "").split("\n").filter(Boolean);
+            const amount =
+              row.rate === "" || row.rate == null ? "" : formatNumber(qtyOrdered * rate);
             return (
-              <View style={styles.tr} key={i} wrap={false}>
+              <View style={styles.tr} key={`r-${i}`} wrap={false}>
                 <Text style={[styles.td, styles.colSr]}>{i + 1}</Text>
-                <Text style={[styles.td, styles.colDescription]}>{row.description}</Text>
-                <Text style={[styles.td, styles.colDesign]}>{row.design}</Text>
-                <Text style={[styles.td, styles.colQty]}>{formatNumber(qty)}</Text>
-                <Text style={[styles.td, styles.colRate]}>{row.rate === "" || row.rate == null ? "" : formatNumber(rate)}</Text>
-                <Text style={[styles.tdLast, styles.colAmount]}>{formatNumber(qty * rate)}</Text>
+                <Text style={[styles.td, styles.colDescription]}>{row.description || ""}</Text>
+                <View style={[styles.td, styles.colDesign]}>
+                  {designLines.length ? (
+                    designLines.map((d, di) => (
+                      <Text key={di} style={styles.designLine}>
+                        {d}
+                      </Text>
+                    ))
+                  ) : (
+                    <Text> </Text>
+                  )}
+                </View>
+                <Text style={[styles.td, styles.colQty]}>
+                  {qtyOrdered ? formatNumber(qtyOrdered) : ""}
+                </Text>
+                <Text style={[styles.td, styles.colRate]}>
+                  {row.rate === "" || row.rate == null ? "" : formatNumber(rate)}
+                </Text>
+                <Text style={[styles.tdLast, styles.colAmount]}>{amount}</Text>
               </View>
             );
           })}
 
-          <View style={styles.tr}>
+          {Array.from({ length: emptyCount }, (_, i) => (
+            <EmptyRow key={`e-${i}`} sr={filled.length + i + 1} />
+          ))}
+
+          <View style={styles.subTotalRow}>
             <Text style={styles.subTotalLabel}>Sub Total</Text>
             <Text style={styles.subTotalValue}>{formatNumber(subTotal)}</Text>
           </View>
         </View>
+
+        {/* Push signatures to the bottom of the page */}
+        <View style={styles.spacer} />
 
         <View style={styles.signatureRow}>
           <View style={styles.signatureBlock}>

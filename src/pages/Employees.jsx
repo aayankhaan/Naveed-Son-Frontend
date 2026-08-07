@@ -4,17 +4,19 @@
 // employee earnings/work-log modal, and full CRUD (Add/Edit/Delete).
 // ========================================
 
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import { Link } from "react-router-dom";
-import {
-  AreaChart, Area, PieChart, Pie, Cell,
-  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-} from "recharts";
 import { FONT, COLORS } from "../constants/theme";
-import Sidebar from "../components/layout/Sidebar";
+import AppShell from "../components/layout/AppShell";
+import ModalLayer from "../components/ui/ModalLayer";
 import MiniStat from "../components/ui/MiniStat";
 import { SearchIcon, ChevronIcon, CloseIcon, SparkIcon } from "../components/icons/CommonIcons";
 import { API_BASE, apiFetch } from "../lib/api";
+import { getEmployeeBatchDateSetting, setEmployeeBatchDateSetting } from "../lib/employeeBatchDate";
+import LoansTab from "../components/employees/LoansTab";
+import EmployeePayModal from "../components/employees/EmployeePayModal";
+import { useAuth } from "../context/AuthContext";
+import ReadOnlyBanner from "../components/auth/ReadOnlyBanner";
 
 // Turns a relative "/uploads/xyz.jpg" path from the backend into a full URL
 // the browser can actually load. Leaves absolute URLs and blob: previews as-is.
@@ -29,84 +31,46 @@ const STATION_META = [
   { name: "Stitching", color: COLORS.gold },
   { name: "Checking", color: COLORS.goldDim },
   { name: "Packing", color: COLORS.green },
+  { name: "Management", color: COLORS.rust },
 ];
 const STATION_COLOR = Object.fromEntries(STATION_META.map((s) => [s.name, s.color]));
+const FLOOR_STATIONS = ["Cutting", "Stitching", "Checking", "Packing"];
 
-const ITEM_META = [
-  { name: "Bedsheet — King", color: COLORS.gold },
-  { name: "Bedsheet — Queen", color: COLORS.goldDim },
-  { name: "Pillow cover", color: COLORS.green },
-  { name: "Cushion cover", color: COLORS.rust },
-];
-
-const RATE_CARD = {
-  Cutting: { "Bedsheet — King": 2.5, "Bedsheet — Queen": 2, "Pillow cover": 1, "Cushion cover": 1.2 },
-  Stitching: { "Bedsheet — King": 5, "Bedsheet — Queen": 4, "Pillow cover": 2, "Cushion cover": 2.5 },
-  Checking: { "Bedsheet — King": 1.5, "Bedsheet — Queen": 1.2, "Pillow cover": 0.6, "Cushion cover": 0.8 },
-  Packing: { "Bedsheet — King": 1, "Bedsheet — Queen": 0.8, "Pillow cover": 0.5, "Cushion cover": 0.6 },
-};
-
-const STATION_QTY_RANGE = {
-  Cutting: [150, 260],
-  Stitching: [60, 110],
-  Checking: [180, 260],
-  Packing: [120, 200],
-};
+function isManagementStation(station) {
+  return String(station || "").trim().toLowerCase() === "management";
+}
 
 const PAY_CYCLE_DAYS = 15;
 
-const INSTALLMENTS = {
-  "EMP-101": { principal: 100000, percent: 50, paidSoFar: 40000 },
-  "EMP-103": { principal: 50000, percent: 50, paidSoFar: 0 },
-  "EMP-108": { principal: 30000, percent: 30, paidSoFar: 15000 },
-};
+/** Merge roster API totals into employee card shape. */
+function buildEmployee(base, payTotals = {}) {
+  const numericId = Number(String(base.id).replace("EMP-", ""));
+  const t = payTotals[numericId] || {};
+  const inst = t.installment || null;
+  const advance = t.advance || null;
+  const installment = inst
+    ? {
+        principal: Number(inst.principal) || 0,
+        perPayout: Number(inst.per_payout) || 0,
+        paidSoFar: Number(inst.paid_so_far) || 0,
+        payoutsRemaining: inst.payouts_remaining,
+        balance: Number(inst.balance) || 0,
+      }
+    : null;
 
-function seedRandom(seed) {
-  let s = seed;
-  return () => {
-    s = (s * 9301 + 49297) % 233280;
-    return s / 233280;
+  return {
+    ...base,
+    units: Number(t.units) || 0,
+    gross: Number(t.raw_gross) || 0,
+    settledUnpaid: Number(t.settled_unpaid) || 0,
+    installment,
+    advance,
+    remainingBalance:
+      (installment ? Number(installment.balance) || 0 : 0) +
+      (advance ? Number(advance.remaining_amount) || 0 : 0),
+    perCycleDeduction: Number(t.per_cycle_deduction) || 0,
+    netDue: Number(t.net_due) || 0,
   };
-}
-
-function buildWorkLog(employee, days = PAY_CYCLE_DAYS) {
-  const seed = employee.id.split("").reduce((s, c) => s + c.charCodeAt(0), 0);
-  const rand = seedRandom(seed);
-  const rates = RATE_CARD[employee.station] || RATE_CARD["Stitching"];
-  const [qMin, qMax] = STATION_QTY_RANGE[employee.station] || STATION_QTY_RANGE["Stitching"];
-  const today = new Date();
-  const log = [];
-  for (let i = days - 1; i >= 0; i--) {
-    const d = new Date(today);
-    d.setDate(d.getDate() - i);
-    const label = d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-    const r = rand();
-    const item =
-      r < 0.4 ? "Bedsheet — King" : r < 0.65 ? "Bedsheet — Queen" : r < 0.85 ? "Pillow cover" : "Cushion cover";
-    const qty = Math.round(qMin + rand() * (qMax - qMin));
-    const rate = rates[item] || 1;
-    log.push({ date: label, item, qty, rate, amount: Math.round(qty * rate) });
-  }
-  return log;
-}
-
-function buildEmployee(base) {
-  const workLog = buildWorkLog(base);
-  const gross = workLog.reduce((s, e) => s + e.amount, 0);
-  const units = workLog.reduce((s, e) => s + e.qty, 0);
-  const installment = INSTALLMENTS[base.id] || null;
-  const balanceBefore = installment ? Math.max(0, installment.principal - installment.paidSoFar) : 0;
-  const perCycleDeduction = installment ? Math.min(balanceBefore, Math.round((gross * installment.percent) / 100)) : 0;
-  const remainingBalance = installment ? balanceBefore - perCycleDeduction : 0;
-  const paidPct = installment ? Math.round(((installment.principal - remainingBalance) / installment.principal) * 100) : 0;
-  const netDue = Math.max(0, gross - perCycleDeduction);
-  const breakdown = ITEM_META.map((it) => ({
-    name: it.name,
-    color: it.color,
-    value: workLog.filter((e) => e.item === it.name).reduce((s, e) => s + e.amount, 0),
-  })).filter((it) => it.value > 0);
-
-  return { ...base, workLog, gross, units, installment, remainingBalance, perCycleDeduction, paidPct, netDue, breakdown };
 }
 
 function initials(name) {
@@ -251,21 +215,32 @@ function StationBadge({ station }) {
 }
 
 function InstallmentBadge({ employee }) {
-  if (!employee.installment) {
+  if (!employee.installment && !employee.advance) {
     return (
       <span className="text-[11px] font-medium px-2 py-1 rounded-full whitespace-nowrap" style={{ background: COLORS.boneDim, color: COLORS.graphiteLight }}>
-        No installment
+        No dues
       </span>
     );
   }
+  if (!employee.installment && employee.advance) {
+    const n = employee.advance.count || 1;
+    return (
+      <span className="text-[11px] font-medium px-2 py-1 rounded-full whitespace-nowrap" style={{ background: COLORS.goldSoft, color: COLORS.goldDim }}>
+        Adv {formatPKR(employee.advance.remaining_amount)}
+        {n > 1 ? ` ×${n}` : ""}
+      </span>
+    );
+  }
+  const n = employee.installment?.count || 1;
   return (
     <span className="text-[11px] font-semibold px-2 py-1 rounded-full whitespace-nowrap" style={{ background: COLORS.rustSoft, color: COLORS.rust }}>
       {formatPKR(employee.remainingBalance)} left
+      {n > 1 ? ` · ${n} plans` : ""}
     </span>
   );
 }
 
-function EmployeeRow({ employee, index, onOpen, onEdit, onDelete }) {
+function EmployeeRow({ employee, index, onOpen, onEdit, onDelete, canWrite = true }) {
   return (
     <tr className="tbl-row cursor-pointer" style={{ borderTop: `1px solid ${COLORS.border}` }} onClick={() => onOpen(employee)}>
       <td className="px-5 py-3.5">
@@ -300,33 +275,49 @@ function EmployeeRow({ employee, index, onOpen, onEdit, onDelete }) {
           </span>
         </span>
       </td>
-      <td className="px-5 py-3.5"><StationBadge station={employee.station} /></td>
+      <td className="px-5 py-3.5">
+        <div className="flex flex-col gap-0.5">
+          <StationBadge station={employee.station} />
+          {isManagementStation(employee.station) && employee.monthlySalary > 0 && (
+            <span className="text-[10.5px]" style={{ color: COLORS.graphiteLight }}>
+              {formatPKR(employee.monthlySalary)} · day {employee.payDay || "—"}
+            </span>
+          )}
+        </div>
+      </td>
       <td className="px-5 py-3.5 text-right" style={{ color: COLORS.graphite }}>{employee.units.toLocaleString()}</td>
-      <td className="px-5 py-3.5 text-right font-medium" style={{ color: COLORS.ink }}>{formatPKR(employee.gross)}</td>
+      <td className="px-5 py-3.5 text-right" style={{ color: COLORS.graphiteLight }}>
+        <div className="font-medium" style={{ color: COLORS.ink }}>{formatPKR(employee.settledUnpaid || 0)}</div>
+        <div className="text-[10px]">raw {formatPKR(employee.gross)}</div>
+      </td>
       <td className="px-5 py-3.5"><InstallmentBadge employee={employee} /></td>
       <td className="px-5 py-3.5 text-right font-semibold" style={{ color: employee.netDue > 0 ? COLORS.rust : COLORS.green }}>
         {formatPKR(employee.netDue)}
       </td>
       <td className="px-5 py-3.5 text-right">
         <div className="flex items-center justify-end gap-1.5" onClick={(e) => e.stopPropagation()}>
-          <button
-            type="button"
-            className="btn-secondary p-1.5 rounded-lg shrink-0"
-            title="Edit employee"
-            style={{ border: `1px solid ${COLORS.border}`, color: COLORS.graphite }}
-            onClick={() => onEdit(employee)}
-          >
-            <PencilIcon />
-          </button>
-          <button
-            type="button"
-            className="btn-secondary p-1.5 rounded-lg shrink-0"
-            title="Delete employee"
-            style={{ border: `1px solid ${COLORS.border}`, color: COLORS.rust, background: COLORS.rustSoft }}
-            onClick={() => onDelete(employee)}
-          >
-            <TrashIcon />
-          </button>
+          {canWrite ? (
+            <>
+              <button
+                type="button"
+                className="btn-secondary p-1.5 rounded-lg shrink-0"
+                title="Edit employee"
+                style={{ border: `1px solid ${COLORS.border}`, color: COLORS.graphite }}
+                onClick={() => onEdit(employee)}
+              >
+                <PencilIcon />
+              </button>
+              <button
+                type="button"
+                className="btn-secondary p-1.5 rounded-lg shrink-0"
+                title="Delete employee"
+                style={{ border: `1px solid ${COLORS.border}`, color: COLORS.rust, background: COLORS.rustSoft }}
+                onClick={() => onDelete(employee)}
+              >
+                <TrashIcon />
+              </button>
+            </>
+          ) : null}
           <button
             type="button"
             className="p-1.5 rounded-lg shrink-0 text-graphiteLight"
@@ -342,262 +333,16 @@ function EmployeeRow({ employee, index, onOpen, onEdit, onDelete }) {
   );
 }
 
-function EmployeeModal({ employee, onClose, onEdit, onDelete }) {
-  useEffect(() => {
-    const onKey = (e) => e.key === "Escape" && onClose();
-    document.addEventListener("keydown", onKey);
-    document.body.style.overflow = "hidden";
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      document.body.style.overflow = "";
-    };
-  }, [onClose]);
-
+function EmployeeModal({ employee, onClose, onEdit, onDelete, onPaid }) {
   if (!employee) return null;
-
-  const chartData = employee.workLog.map((e) => ({ date: e.date, amount: e.amount }));
-
   return (
-    <div className="modal-overlay fixed inset-0 z-60 flex items-center justify-center p-3 sm:p-6" onClick={onClose}>
-      <div
-        className="modal-pop w-full max-w-3xl max-h-[92vh] overflow-y-auto rounded-2xl"
-        style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}
-        onClick={(e) => e.stopPropagation()}
-        role="dialog"
-        aria-modal="true"
-      >
-        <div className="flex items-start justify-between gap-3 px-6 py-5 sticky top-0 z-10" style={{ background: COLORS.card, borderBottom: `1px solid ${COLORS.border}` }}>
-          <div className="flex items-center gap-3.5 min-w-0">
-            <span className="w-12 h-12 rounded-full flex items-center justify-center text-[15px] font-semibold shrink-0 overflow-hidden" style={{ background: COLORS.goldSoft, color: COLORS.goldDim }}>
-              {employee.image ? (
-                <img src={getImageUrl(employee.image)} alt={employee.name} className="w-full h-full object-cover" />
-              ) : (
-                initials(employee.name)
-              )}
-            </span>
-            <div className="min-w-0">
-              <h2 className="text-[16px] font-semibold truncate" style={{ color: COLORS.ink }}>{employee.name}</h2>
-              <div className="flex items-center gap-2 mt-1 flex-wrap">
-                <StationBadge station={employee.station} />
-                <span className="text-[11.5px]" style={{ color: COLORS.graphiteLight }}>
-                  {employee.id} · Joined {employee.joined}
-                </span>
-              </div>
-              <div className="flex items-center gap-3 mt-1 text-[11.5px] flex-wrap" style={{ color: COLORS.graphite }}>
-                {employee.cnic && employee.cnic !== "—" && <span>CNIC: <strong>{employee.cnic}</strong></span>}
-                {employee.phone && employee.phone !== "—" && <span>Phone: <strong>{employee.phone}</strong></span>}
-              </div>
-            </div>
-          </div>
-          <div className="flex items-center gap-2 shrink-0">
-            <button
-              type="button"
-              className="btn-secondary text-[12px] font-semibold px-3 py-1.5 rounded-lg inline-flex items-center gap-1.5"
-              style={{ border: `1px solid ${COLORS.border}`, color: COLORS.graphite }}
-              onClick={() => {
-                onClose();
-                onEdit(employee);
-              }}
-            >
-              <PencilIcon /> Edit
-            </button>
-            <button
-              type="button"
-              className="btn-secondary text-[12px] font-semibold px-3 py-1.5 rounded-lg inline-flex items-center gap-1.5"
-              style={{ border: `1px solid ${COLORS.border}`, color: COLORS.rust, background: COLORS.rustSoft }}
-              onClick={() => {
-                onClose();
-                onDelete(employee);
-              }}
-            >
-              <TrashIcon /> Delete
-            </button>
-            <button type="button" className="btn-secondary p-2 rounded-lg shrink-0" style={{ border: `1px solid ${COLORS.border}`, color: COLORS.graphite }} onClick={onClose} aria-label="Close">
-              <CloseIcon />
-            </button>
-          </div>
-        </div>
-
-        <div className="p-6">
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
-            <div className="rounded-xl p-4" style={{ background: COLORS.boneDim }}>
-              <div className="text-[10.5px] font-semibold uppercase tracking-wide" style={{ color: COLORS.graphite }}>Units this cycle</div>
-              <div className="text-[19px] font-semibold mt-1" style={{ color: COLORS.ink }}>{employee.units.toLocaleString()}</div>
-            </div>
-            <div className="rounded-xl p-4" style={{ background: COLORS.boneDim }}>
-              <div className="text-[10.5px] font-semibold uppercase tracking-wide" style={{ color: COLORS.graphite }}>Gross earned</div>
-              <div className="text-[19px] font-semibold mt-1" style={{ color: COLORS.ink }}>{formatPKR(employee.gross)}</div>
-            </div>
-            <div className="rounded-xl p-4" style={{ background: COLORS.boneDim }}>
-              <div className="text-[10.5px] font-semibold uppercase tracking-wide" style={{ color: COLORS.graphite }}>Installment deducted</div>
-              <div className="text-[19px] font-semibold mt-1" style={{ color: employee.perCycleDeduction ? COLORS.rust : COLORS.ink }}>
-                {employee.perCycleDeduction ? `− ${formatPKR(employee.perCycleDeduction)}` : "—"}
-              </div>
-            </div>
-            <div className="rounded-xl p-4" style={{ background: COLORS.goldSoft }}>
-              <div className="text-[10.5px] font-semibold uppercase tracking-wide" style={{ color: COLORS.goldDim }}>Net due now</div>
-              <div className="text-[19px] font-semibold mt-1" style={{ color: COLORS.ink }}>{formatPKR(employee.netDue)}</div>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 lg:grid-cols-5 gap-4 mb-6">
-            <div className="lg:col-span-3 rounded-2xl p-5" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
-              <h3 className="text-[13px] font-semibold mb-3" style={{ color: COLORS.ink }}>Earnings this cycle</h3>
-              <div style={{ width: "100%", height: 180 }}>
-                <ResponsiveContainer>
-                  <AreaChart data={chartData} margin={{ top: 4, right: 4, left: -22, bottom: 0 }}>
-                    <defs>
-                      <linearGradient id="empEarnFill" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="0%" stopColor={COLORS.gold} stopOpacity={0.38} />
-                        <stop offset="100%" stopColor={COLORS.gold} stopOpacity={0.02} />
-                      </linearGradient>
-                    </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke={COLORS.border} vertical={false} />
-                    <XAxis dataKey="date" tick={{ fontSize: 10, fill: COLORS.graphiteLight }} axisLine={{ stroke: COLORS.border }} tickLine={false} interval={2} />
-                    <YAxis tick={{ fontSize: 10, fill: COLORS.graphiteLight }} axisLine={false} tickLine={false} />
-                    <Tooltip
-                      contentStyle={{ background: COLORS.ink, border: "none", borderRadius: 10, fontSize: 12, padding: "8px 12px" }}
-                      labelStyle={{ color: COLORS.bone }}
-                      itemStyle={{ color: COLORS.gold }}
-                      formatter={(v) => [`PKR ${v.toLocaleString()}`, "Earned"]}
-                    />
-                    <Area type="monotone" dataKey="amount" stroke={COLORS.gold} strokeWidth={2.2} fill="url(#empEarnFill)" activeDot={{ r: 4, fill: COLORS.gold, stroke: COLORS.card, strokeWidth: 2 }} />
-                  </AreaChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-
-            <div className="lg:col-span-2 rounded-2xl p-5" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
-              <h3 className="text-[13px] font-semibold mb-1" style={{ color: COLORS.ink }}>Work breakdown</h3>
-              <p className="text-[11px] mb-1" style={{ color: COLORS.graphiteLight }}>By item, this cycle</p>
-              <div className="relative" style={{ width: "100%", height: 150 }}>
-                <ResponsiveContainer>
-                  <PieChart>
-                    <Pie data={employee.breakdown} dataKey="value" nameKey="name" innerRadius={40} outerRadius={62} paddingAngle={3} stroke="none">
-                      {employee.breakdown.map((it) => (
-                        <Cell key={it.name} fill={it.color} />
-                      ))}
-                    </Pie>
-                    <Tooltip
-                      contentStyle={{ background: COLORS.ink, border: "none", borderRadius: 10, fontSize: 11, padding: "6px 10px" }}
-                      labelStyle={{ color: COLORS.bone }}
-                      formatter={(v) => [`PKR ${v.toLocaleString()}`, ""]}
-                    />
-                  </PieChart>
-                </ResponsiveContainer>
-              </div>
-              <div className="flex flex-col gap-1.5 mt-1">
-                {employee.breakdown.map((it) => (
-                  <div key={it.name} className="flex items-center justify-between text-[11px]">
-                    <span className="flex items-center gap-1.5 truncate" style={{ color: COLORS.graphite }}>
-                      <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: it.color }} />
-                      <span className="truncate">{it.name}</span>
-                    </span>
-                    <span className="font-semibold shrink-0" style={{ color: COLORS.ink }}>{formatPKR(it.value)}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          <div className="rounded-2xl p-5 mb-6" style={{ background: COLORS.boneDim, border: `1px solid ${COLORS.border}` }}>
-            <div className="flex items-center justify-between mb-2">
-              <h3 className="text-[13px] font-semibold" style={{ color: COLORS.ink }}>Quality Control (QC) &amp; Defect Audit</h3>
-              <span className="text-[11px] font-semibold px-2.5 py-0.5 rounded-full" style={{ background: COLORS.greenSoft, color: COLORS.green }}>
-                98.5% Pass Rate
-              </span>
-            </div>
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-[11.5px]">
-              <div>
-                <span className="text-[10px] uppercase font-semibold block" style={{ color: COLORS.graphiteLight }}>Inspected Output</span>
-                <strong style={{ color: COLORS.ink }}>{(employee.units * 1.02).toFixed(0)} pcs</strong>
-              </div>
-              <div>
-                <span className="text-[10px] uppercase font-semibold block" style={{ color: COLORS.graphiteLight }}>Passed Units</span>
-                <strong style={{ color: COLORS.ink }}>{employee.units.toLocaleString()} pcs</strong>
-              </div>
-              <div>
-                <span className="text-[10px] uppercase font-semibold block" style={{ color: COLORS.graphiteLight }}>Defects / Rework</span>
-                <strong style={{ color: COLORS.goldDim }}>{Math.round(employee.units * 0.015)} pcs</strong>
-              </div>
-            </div>
-          </div>
-
-          <div className="rounded-2xl p-5 mb-6" style={{ background: employee.installment ? COLORS.rustSoft : COLORS.boneDim, border: `1px solid ${COLORS.border}` }}>
-            <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
-              <h3 className="text-[13px] font-semibold flex items-center gap-2" style={{ color: COLORS.ink }}>
-                <LoanIcon /> Installment
-              </h3>
-              {!employee.installment && (
-                <button type="button" className="btn-link text-[11.5px] font-semibold" style={{ color: COLORS.goldDim }}>
-                  + Record installment
-                </button>
-              )}
-            </div>
-            {employee.installment ? (
-              <>
-                <p className="text-[11.5px] mb-3" style={{ color: COLORS.graphite }}>
-                  Took {formatPKR(employee.installment.principal)} in advance. {employee.installment.percent}% of gross earnings is deducted every cycle until it's settled — so a light cycle never eats their whole pay.
-                </p>
-                <div className="h-2 rounded-full overflow-hidden mb-2" style={{ background: `${COLORS.card}` }}>
-                  <div className="h-2 rounded-full" style={{ width: `${employee.paidPct}%`, background: COLORS.rust }} />
-                </div>
-                <div className="flex flex-wrap items-center justify-between gap-2 text-[11.5px]">
-                  <span style={{ color: COLORS.graphite }}>{employee.paidPct}% repaid</span>
-                  <span style={{ color: COLORS.graphite }}>− {formatPKR(employee.perCycleDeduction)} deducted this cycle</span>
-                  <span className="font-semibold" style={{ color: COLORS.rust }}>{formatPKR(employee.remainingBalance)} balance left</span>
-                </div>
-              </>
-            ) : (
-              <p className="text-[11.5px]" style={{ color: COLORS.graphiteLight }}>No active installment for this employee — nothing is deducted from their pay.</p>
-            )}
-          </div>
-
-          <div className="rounded-2xl overflow-hidden" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
-            <div className="px-5 py-3.5" style={{ borderBottom: `1px solid ${COLORS.border}`, background: COLORS.boneDim }}>
-              <h3 className="text-[13px] font-semibold" style={{ color: COLORS.ink }}>Work log — this cycle</h3>
-            </div>
-            <div className="max-h-55 overflow-y-auto">
-              <table className="w-full text-[12px]">
-                <thead>
-                  <tr>
-                    <th className="text-left font-semibold px-5 py-2 uppercase text-[10px] tracking-wide sticky top-0" style={{ color: COLORS.graphite, background: COLORS.card }}>Date</th>
-                    <th className="text-left font-semibold px-5 py-2 uppercase text-[10px] tracking-wide sticky top-0" style={{ color: COLORS.graphite, background: COLORS.card }}>Item</th>
-                    <th className="text-right font-semibold px-5 py-2 uppercase text-[10px] tracking-wide sticky top-0" style={{ color: COLORS.graphite, background: COLORS.card }}>Qty</th>
-                    <th className="text-right font-semibold px-5 py-2 uppercase text-[10px] tracking-wide sticky top-0" style={{ color: COLORS.graphite, background: COLORS.card }}>Rate</th>
-                    <th className="text-right font-semibold px-5 py-2 uppercase text-[10px] tracking-wide sticky top-0" style={{ color: COLORS.graphite, background: COLORS.card }}>Amount</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {[...employee.workLog].reverse().map((e, i) => (
-                    <tr key={i} className="tbl-row" style={{ borderTop: `1px solid ${COLORS.border}` }}>
-                      <td className="px-5 py-2.5" style={{ color: COLORS.graphiteLight }}>{e.date}</td>
-                      <td className="px-5 py-2.5" style={{ color: COLORS.graphite }}>{e.item}</td>
-                      <td className="px-5 py-2.5 text-right" style={{ color: COLORS.graphite }}>{e.qty}</td>
-                      <td className="px-5 py-2.5 text-right" style={{ color: COLORS.graphiteLight }}>PKR {e.rate}</td>
-                      <td className="px-5 py-2.5 text-right font-medium" style={{ color: COLORS.ink }}>{formatPKR(e.amount)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-
-        <div className="sticky bottom-0 flex flex-wrap items-center justify-between gap-3 px-6 py-4" style={{ background: COLORS.card, borderTop: `1px solid ${COLORS.border}` }}>
-          <div className="flex items-center gap-2 text-[11.5px]" style={{ color: COLORS.graphiteLight }}>
-            <CalendarIcon /> Paid every {PAY_CYCLE_DAYS} days
-          </div>
-          <div className="flex items-center gap-3">
-            <span className="text-[12.5px]" style={{ color: COLORS.graphite }}>Net payable</span>
-            <span className="text-[18px] font-semibold" style={{ color: COLORS.ink }}>{formatPKR(employee.netDue)}</span>
-            <button type="button" className="btn-primary text-[12.5px] font-semibold px-4 py-2 rounded-lg" style={{ background: COLORS.gold, color: COLORS.ink }}>
-              Record payment
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
+    <EmployeePayModal
+      employee={employee}
+      onClose={onClose}
+      onEdit={onEdit}
+      onDelete={onDelete}
+      onPaid={onPaid}
+    />
   );
 }
 
@@ -609,6 +354,14 @@ function AddEditEmployeeModal({ employee, onClose, onSave }) {
   const [station, setStation] = useState(employee?.station || "Stitching");
   const [joinedISO, setJoinedISO] = useState(dmyToISO(employee?.joined) || todayISO());
   const [image, setImage] = useState(employee?.image || "");
+  const [batchDate, setBatchDate] = useState(() => getEmployeeBatchDateSetting(employee?.id) || "");
+  const [monthlySalary, setMonthlySalary] = useState(
+    employee?.monthlySalary != null && employee.monthlySalary !== "" ? String(employee.monthlySalary) : ""
+  );
+  const [payDay, setPayDay] = useState(
+    employee?.payDay != null && employee.payDay !== "" ? String(employee.payDay) : "1"
+  );
+  const isManagement = isManagementStation(station);
 
   const cnicTouched = cnic.length > 0;
   const phoneTouched = phone.length > 0;
@@ -665,6 +418,18 @@ function AddEditEmployeeModal({ employee, onClose, onSave }) {
       setError("Please enter a valid Pakistani phone number (starts with 03, 11 digits).");
       return;
     }
+    if (isManagement) {
+      const salary = Number(monthlySalary);
+      const day = Number(payDay);
+      if (!(salary > 0)) {
+        setError("Management staff need a monthly pay amount.");
+        return;
+      }
+      if (!(day >= 1 && day <= 31)) {
+        setError("Pay day must be between 1 and 31.");
+        return;
+      }
+    }
 
     setSaving(true);
     setError("");
@@ -676,6 +441,8 @@ function AddEditEmployeeModal({ employee, onClose, onSave }) {
       joining_date: joinedISO,
       station,
       image_link: image.trim(),
+      monthly_salary: isManagement ? Number(monthlySalary) : null,
+      pay_day: isManagement ? Number(payDay) : null,
     };
 
     const numericId = isEditing ? employee.id.replace("EMP-", "") : null;
@@ -697,14 +464,19 @@ function AddEditEmployeeModal({ employee, onClose, onSave }) {
         return;
       }
 
+      const savedId = `EMP-${data.e_id}`;
+      setEmployeeBatchDateSetting(savedId, batchDate);
+
       onSave({
-        id: `EMP-${data.e_id}`,
+        id: savedId,
         name: data.full_name,
         cnic: data.cnic_number || "—",
         phone: data.phone_number || "—",
         station: data.station,
         joined: data.joining_date,
         image: data.image_link,
+        monthlySalary: data.monthly_salary != null ? Number(data.monthly_salary) : null,
+        payDay: data.pay_day != null ? Number(data.pay_day) : null,
       });
     } catch (err) {
       console.error(err);
@@ -714,7 +486,7 @@ function AddEditEmployeeModal({ employee, onClose, onSave }) {
     }
   }
   return (
-    <div className="modal-overlay fixed inset-0 z-60 flex items-center justify-center p-3 sm:p-6" onClick={onClose}>
+    <ModalLayer onClose={onClose} zClass="z-[90]" alignClass="items-center justify-center p-3 sm:p-6">
       <div
         className="modal-pop w-full max-w-lg rounded-2xl overflow-hidden"
         style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}
@@ -831,6 +603,11 @@ function AddEditEmployeeModal({ employee, onClose, onSave }) {
                   <path d="M2.5 4.5L6 8l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
               </div>
+              {isManagement && (
+                <p className="text-[10.5px] mt-1" style={{ color: COLORS.graphiteLight }}>
+                  Monthly salary — not piece-rate. Installments &amp; advances still apply.
+                </p>
+              )}
             </div>
 
             <div>
@@ -845,6 +622,53 @@ function AddEditEmployeeModal({ employee, onClose, onSave }) {
                 Saved as {isoToDMY(joinedISO) || "—"}
               </p>
             </div>
+
+            {isManagement ? (
+              <>
+                <div>
+                  <label className="form-label">Monthly pay (PKR) *</label>
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    required
+                    className="form-input"
+                    value={monthlySalary}
+                    onChange={(e) => setMonthlySalary(e.target.value)}
+                    placeholder="e.g. 45000"
+                  />
+                </div>
+                <div>
+                  <label className="form-label">Pay day of month *</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="31"
+                    required
+                    className="form-input"
+                    value={payDay}
+                    onChange={(e) => setPayDay(e.target.value)}
+                    placeholder="e.g. 30"
+                  />
+                  <p className="text-[10.5px] mt-1" style={{ color: COLORS.graphiteLight }}>
+                    Salary posts on this day each month. If you set them up after that day, the first post is next month. Paying clears the balance.
+                  </p>
+                </div>
+              </>
+            ) : (
+              <div className="sm:col-span-2">
+                <label className="form-label">Production batch date (optional)</label>
+                <input
+                  type="date"
+                  className="form-input"
+                  value={batchDate}
+                  onChange={(e) => setBatchDate(e.target.value)}
+                />
+                <p className="text-[10.5px] mt-1" style={{ color: COLORS.graphiteLight }}>
+                  Leave empty to always log on today. Set only if this person should post to a fixed batch date.
+                </p>
+              </div>
+            )}
 
             <div className="sm:col-span-2">
               <label className="form-label">Image URL (Optional)</label>
@@ -878,7 +702,7 @@ function AddEditEmployeeModal({ employee, onClose, onSave }) {
           </div>
         </form>
       </div>
-    </div>
+    </ModalLayer>
   );
 }
 
@@ -886,7 +710,7 @@ function DeleteConfirmModal({ employee, onClose, onConfirm }) {
   if (!employee) return null;
 
   return (
-    <div className="modal-overlay fixed inset-0 z-70 flex items-center justify-center p-4" onClick={onClose}>
+    <ModalLayer onClose={onClose} zClass="z-[90]" alignClass="items-center justify-center p-4">
       <div
         className="modal-pop w-full max-w-md rounded-2xl p-6"
         style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}
@@ -922,12 +746,13 @@ function DeleteConfirmModal({ employee, onClose, onConfirm }) {
           </button>
         </div>
       </div>
-    </div>
+    </ModalLayer>
   );
 }
 
 export default function EmployeesPage() {
-  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const { canWrite } = useAuth();
+  const [pageTab, setPageTab] = useState("roster"); // roster | loans
   const [search, setSearch] = useState("");
   const [stationFilter, setStationFilter] = useState("All stations");
   const [selectedId, setSelectedId] = useState(null);
@@ -937,6 +762,23 @@ export default function EmployeesPage() {
   const [deletingEmployee, setDeletingEmployee] = useState(null);
 
   const [employeeBases, setEmployeeBases] = useState([]);
+  const [payTotals, setPayTotals] = useState({});
+  const [loanModalRequest, setLoanModalRequest] = useState(null); // 'installment' | 'advance' | null
+
+  useEffect(() => {
+    if (!canWrite && pageTab === "loans") setPageTab("roster");
+  }, [canWrite, pageTab]);
+
+  const refreshPayTotals = useCallback(async () => {
+    try {
+      const res = await apiFetch("/api/payouts/roster-totals");
+      if (!res.ok) return;
+      const data = await res.json();
+      setPayTotals(data.totals || {});
+    } catch (err) {
+      console.error("Failed to fetch pay totals", err);
+    }
+  }, []);
 
   useEffect(() => {
     async function fetchEmployees() {
@@ -951,6 +793,8 @@ export default function EmployeesPage() {
           station: emp.station,
           joined: emp.joining_date,
           image: emp.image_link,
+          monthlySalary: emp.monthly_salary != null ? Number(emp.monthly_salary) : null,
+          payDay: emp.pay_day != null ? Number(emp.pay_day) : null,
         }));
         setEmployeeBases(mapped);
       } catch (err) {
@@ -958,9 +802,18 @@ export default function EmployeesPage() {
       }
     }
     fetchEmployees();
-  }, []);
+    refreshPayTotals();
+  }, [refreshPayTotals]);
 
-  const employees = useMemo(() => employeeBases.map(buildEmployee), [employeeBases]);
+  useEffect(() => {
+    if (pageTab !== "roster") return;
+    refreshPayTotals();
+  }, [pageTab, refreshPayTotals]);
+
+  const employees = useMemo(
+    () => employeeBases.map((base) => buildEmployee(base, payTotals)),
+    [employeeBases, payTotals]
+  );
   const selectedEmployee = useMemo(() => employees.find((e) => e.id === selectedId) || null, [employees, selectedId]);
 
   const filtered = useMemo(() => {
@@ -1017,138 +870,202 @@ export default function EmployeesPage() {
   }
 
   return (
-    <div className="min-h-screen w-full flex" style={{ background: COLORS.bone, fontFamily: FONT }}>
-      <Sidebar mobileOpen={mobileNavOpen} onClose={() => setMobileNavOpen(false)} />
-
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center justify-between gap-2.5 px-4 sm:px-6 md:px-8 py-3.5 sticky top-0 z-30 backdrop-blur" style={{ background: `${COLORS.bone}F2`, borderBottom: `1px solid ${COLORS.border}` }}>
-          <div className="flex items-center gap-2.5 min-w-0 flex-1">
-            <button type="button" className="md:hidden p-2 rounded-lg btn-secondary shrink-0" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }} onClick={() => setMobileNavOpen(true)} aria-label="Open navigation">
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M2 4h12M2 8h12M2 12h12" stroke={COLORS.ink} strokeWidth="1.4" strokeLinecap="round" />
-              </svg>
+    <AppShell
+      title="Employees"
+      subtitle={
+        pageTab === "loans"
+          ? "Installments & advances · 15-day payout cycle"
+          : `${employees.length} people across the floor`
+      }
+      maxWidth="80rem"
+      actions={
+        !canWrite
+          ? null
+          : pageTab === "loans" ? (
+          <>
+            <button
+              type="button"
+              className="btn-secondary inline-flex items-center gap-1 text-[11.5px] sm:text-[12.5px] font-semibold px-2.5 sm:px-3.5 py-1.5 sm:py-2 rounded-xl shrink-0"
+              style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, color: COLORS.ink }}
+              onClick={() => setLoanModalRequest("advance")}
+            >
+              <PlusIcon /> <span className="hidden sm:inline">Advance</span><span className="sm:hidden">Adv</span>
             </button>
-            <div className="min-w-0 flex-1">
-              <h1 className="text-base sm:text-xl font-semibold truncate" style={{ color: COLORS.ink }}>Employees</h1>
-              <p className="text-[12px] hidden sm:block truncate" style={{ color: COLORS.graphiteLight }}>{employees.length} people across the floor</p>
-            </div>
-          </div>
-          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              className="btn-primary inline-flex items-center gap-1 text-[11.5px] sm:text-[12.5px] font-semibold px-2.5 sm:px-3.5 py-1.5 sm:py-2 rounded-xl shrink-0"
+              style={{ background: COLORS.gold, color: COLORS.inkSurface }}
+              onClick={() => setLoanModalRequest("installment")}
+            >
+              <PlusIcon /> <span className="hidden sm:inline">Installment</span><span className="sm:hidden">Inst</span>
+            </button>
+          </>
+        ) : (
+          <>
             <Link
               to="/daily-entry"
-              className="btn-primary inline-flex items-center gap-1.5 text-[11.5px] sm:text-[12.5px] font-bold px-2.5 sm:px-3.5 py-1.5 sm:py-2 rounded-lg shrink-0 no-underline"
-              style={{ background: COLORS.ink, color: COLORS.gold, border: `1px solid ${COLORS.gold}` }}
+              className="btn-primary inline-flex items-center gap-1.5 text-[11.5px] sm:text-[12.5px] font-bold px-2.5 sm:px-3.5 py-1.5 sm:py-2 rounded-xl shrink-0 no-underline"
+              style={{ background: COLORS.inkSurface, color: COLORS.gold, border: `1px solid ${COLORS.gold}` }}
             >
-              <SparkIcon size={13} /> <span className="hidden sm:inline">Insert daily data</span><span className="sm:hidden">Daily Entry</span>
+              <SparkIcon size={13} /> <span className="hidden sm:inline">Insert daily data</span><span className="sm:hidden">Daily</span>
             </Link>
             <button
               type="button"
-              className="btn-primary inline-flex items-center gap-1 text-[11.5px] sm:text-[12.5px] font-semibold px-2.5 sm:px-3.5 py-1.5 sm:py-2 rounded-lg shrink-0"
-              style={{ background: COLORS.gold, color: COLORS.ink }}
+              className="btn-primary inline-flex items-center gap-1 text-[11.5px] sm:text-[12.5px] font-semibold px-2.5 sm:px-3.5 py-1.5 sm:py-2 rounded-xl shrink-0"
+              style={{ background: COLORS.gold, color: COLORS.inkSurface }}
               onClick={() => setIsAddModalOpen(true)}
             >
               <PlusIcon /> <span className="hidden sm:inline">Add employee</span><span className="sm:hidden">Add</span>
             </button>
-            <div className="hidden sm:flex flex-col items-end leading-tight border-l pl-3" style={{ borderColor: COLORS.border }}>
-              <span className="text-[13px] font-medium" style={{ color: COLORS.ink }}>Admin</span>
-              <span className="text-[11px]" style={{ color: COLORS.graphiteLight }}>Administrator</span>
-            </div>
-            <div className="w-9 h-9 rounded-full flex items-center justify-center text-[13px] font-semibold shrink-0" style={{ background: COLORS.ink, color: COLORS.gold, border: `2px solid ${COLORS.goldSoft}` }}>
-              A
-            </div>
+          </>
+        )
+      }
+    >
+          <ReadOnlyBanner />
+          <div className="segmented mb-6">
+            {(canWrite
+              ? [
+                  { id: "roster", label: "Roster" },
+                  { id: "loans", label: "Installments & Advances" },
+                ]
+              : [{ id: "roster", label: "Roster" }]
+            ).map((t) => (
+              <button
+                key={t.id}
+                type="button"
+                onClick={() => setPageTab(t.id)}
+                style={{
+                  background: pageTab === t.id ? COLORS.inkSurface : "transparent",
+                  color: pageTab === t.id ? COLORS.onDark : COLORS.graphite,
+                }}
+              >
+                {t.label}
+              </button>
+            ))}
           </div>
-        </div>
 
-        <div className="p-5 md:p-8 max-w-7xl mx-auto">
-          <div className="rounded-2xl px-5 py-3.5 mb-6 flex items-center justify-between flex-wrap gap-3 fade-in" style={{ background: COLORS.goldSoft, border: `1px solid ${COLORS.border}` }}>
-            <div className="flex items-center gap-2.5">
-              <div className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0" style={{ background: COLORS.card, color: COLORS.goldDim }}>
-                <CalendarIcon />
+          {pageTab === "loans" ? (
+            <LoansTab
+              openModal={loanModalRequest}
+              onOpenModalConsumed={() => setLoanModalRequest(null)}
+            />
+          ) : (
+            <>
+              {canWrite ? (
+              <div className="rounded-2xl px-5 py-3.5 mb-6 flex items-center justify-between flex-wrap gap-3 fade-in" style={{ background: COLORS.goldSoft, border: `1px solid ${COLORS.border}` }}>
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0" style={{ background: COLORS.card, color: COLORS.goldDim }}>
+                    <CalendarIcon />
+                  </div>
+                  <div>
+                    <div className="text-[12.5px] font-semibold" style={{ color: COLORS.ink }}>Current pay cycle: {cycleLabel}</div>
+                    <div className="text-[11.5px]" style={{ color: COLORS.goldDim }}>Paid every {PAY_CYCLE_DAYS} days · next payout today</div>
+                  </div>
+                </div>
+                <Link
+                  to="/payouts"
+                  className="btn-primary text-[12px] font-semibold px-3.5 py-2 rounded-lg no-underline inline-flex"
+                  style={{ background: COLORS.ink, color: COLORS.gold }}
+                >
+                  Open payouts
+                </Link>
               </div>
-              <div>
-                <div className="text-[12.5px] font-semibold" style={{ color: COLORS.ink }}>Current pay cycle: {cycleLabel}</div>
-                <div className="text-[11.5px]" style={{ color: COLORS.goldDim }}>Paid every {PAY_CYCLE_DAYS} days · next payout today</div>
+              ) : (
+              <div className="rounded-2xl px-5 py-3.5 mb-6 flex items-center justify-between flex-wrap gap-3 fade-in" style={{ background: COLORS.goldSoft, border: `1px solid ${COLORS.border}` }}>
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0" style={{ background: COLORS.card, color: COLORS.goldDim }}>
+                    <CalendarIcon />
+                  </div>
+                  <div>
+                    <div className="text-[12.5px] font-semibold" style={{ color: COLORS.ink }}>Current pay cycle: {cycleLabel}</div>
+                    <div className="text-[11.5px]" style={{ color: COLORS.goldDim }}>Paid every {PAY_CYCLE_DAYS} days · view only</div>
+                  </div>
+                </div>
               </div>
-            </div>
-            <button type="button" className="btn-primary text-[12px] font-semibold px-3.5 py-2 rounded-lg" style={{ background: COLORS.ink, color: COLORS.gold }}>
-              Settle all dues
-            </button>
-          </div>
+              )}
 
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-            <MiniStat index={0} icon={<UsersIcon />} label="Total employees" value={employees.length} sub={`${STATION_META.length} stations`} />
-            <MiniStat index={1} icon={<CoinsIcon />} label="Earned this cycle" value={formatPKR(totalGross)} sub="gross, piece-rate" />
-            <MiniStat index={2} icon={<LoanIcon />} label="Active installments" value={activeInstallments} sub={`of ${employees.length} employees`} />
-            <MiniStat index={3} icon={<BanknoteIcon />} label="Total due now" value={formatPKR(totalDue)} sub="after deductions" />
-          </div>
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                <MiniStat index={0} icon={<UsersIcon />} label="Total employees" value={employees.length} sub={`${FLOOR_STATIONS.length} floor + Management`} />
+                <MiniStat
+                  index={1}
+                  icon={<CoinsIcon />}
+                  label="Settled payable"
+                  value={formatPKR(employees.reduce((s, e) => s + (e.settledUnpaid || 0), 0))}
+                  sub={`raw logged ${formatPKR(totalGross)}`}
+                />
+                <MiniStat index={2} icon={<LoanIcon />} label="Active installments" value={activeInstallments} sub={`of ${employees.length} employees`} />
+                <MiniStat index={3} icon={<BanknoteIcon />} label="Net payable" value={formatPKR(totalDue)} sub="after installment & advance" />
+              </div>
 
-          <div className="flex flex-wrap items-center gap-3 mb-4">
-            <div className="search-wrap">
-              <SearchIcon />
-              <input type="text" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search name, ID, CNIC or phone" />
-            </div>
-            <div className="select-wrap">
-              <select value={stationFilter} onChange={(e) => setStationFilter(e.target.value)}>
-                {["All stations", ...STATION_META.map((s) => s.name)].map((opt) => (
-                  <option key={opt} value={opt}>{opt}</option>
-                ))}
-              </select>
-              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="select-caret">
-                <path d="M2.5 4.5L6 8l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            </div>
-            <span className="text-[11.5px] ml-auto" style={{ color: COLORS.graphiteLight }}>{filtered.length} shown</span>
-          </div>
+              <div className="flex flex-wrap items-center gap-3 mb-4">
+                <div className="search-wrap">
+                  <SearchIcon />
+                  <input type="text" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search name, ID, CNIC or phone" />
+                </div>
+                <div className="select-wrap">
+                  <select value={stationFilter} onChange={(e) => setStationFilter(e.target.value)}>
+                    {["All stations", ...STATION_META.map((s) => s.name)].map((opt) => (
+                      <option key={opt} value={opt}>{opt}</option>
+                    ))}
+                  </select>
+                  <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="select-caret">
+                    <path d="M2.5 4.5L6 8l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </div>
+                <span className="text-[11.5px] ml-auto" style={{ color: COLORS.graphiteLight }}>{filtered.length} shown</span>
+              </div>
 
-          <div className="rounded-2xl overflow-hidden panel fade-in" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, animationDelay: "120ms" }}>
-            <div className="overflow-x-auto">
-              <table className="w-full text-[12.5px]">
-                <thead>
-                  <tr style={{ background: COLORS.boneDim }}>
-                    <th className="text-left font-semibold px-5 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Employee</th>
-                    <th className="text-left font-semibold px-5 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Station</th>
-                    <th className="text-right font-semibold px-5 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Units</th>
-                    <th className="text-right font-semibold px-5 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Gross earned</th>
-                    <th className="text-left font-semibold px-5 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Installment</th>
-                    <th className="text-right font-semibold px-5 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Net due</th>
-                    <th className="text-right font-semibold px-5 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filtered.map((emp, i) => (
-                    <EmployeeRow
-                      key={emp.id}
-                      employee={emp}
-                      index={i}
-                      onOpen={(e) => setSelectedId(e.id)}
-                      onEdit={(e) => setEditingEmployee(e)}
-                      onDelete={(e) => setDeletingEmployee(e)}
-                    />
-                  ))}
-                  {filtered.length === 0 && (
-                    <tr>
-                      <td colSpan={7} className="px-5 py-8 text-center text-[12.5px]" style={{ color: COLORS.graphiteLight }}>
-                        No employees match your search.
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      </div>
+              <div className="rounded-2xl overflow-hidden panel fade-in" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, animationDelay: "120ms" }}>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[12.5px]">
+                    <thead>
+                      <tr style={{ background: COLORS.boneDim }}>
+                        <th className="text-left font-semibold px-5 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Employee</th>
+                        <th className="text-left font-semibold px-5 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Station</th>
+                        <th className="text-right font-semibold px-5 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Units</th>
+                        <th className="text-right font-semibold px-5 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Payable</th>
+                        <th className="text-left font-semibold px-5 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Dues</th>
+                        <th className="text-right font-semibold px-5 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Net payable</th>
+                        <th className="text-right font-semibold px-5 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filtered.map((emp, i) => (
+                        <EmployeeRow
+                          key={emp.id}
+                          employee={emp}
+                          index={i}
+                          onOpen={(e) => setSelectedId(e.id)}
+                          onEdit={(e) => setEditingEmployee(e)}
+                          onDelete={(e) => setDeletingEmployee(e)}
+                          canWrite={canWrite}
+                        />
+                      ))}
+                      {filtered.length === 0 && (
+                        <tr>
+                          <td colSpan={7} className="px-5 py-8 text-center text-[12.5px]" style={{ color: COLORS.graphiteLight }}>
+                            No employees match your search.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </>
+          )}
 
       {selectedEmployee && (
         <EmployeeModal
           employee={selectedEmployee}
           onClose={() => setSelectedId(null)}
-          onEdit={(e) => setEditingEmployee(e)}
-          onDelete={(e) => setDeletingEmployee(e)}
+          onEdit={canWrite ? (e) => setEditingEmployee(e) : undefined}
+          onDelete={canWrite ? (e) => setDeletingEmployee(e) : undefined}
+          onPaid={canWrite ? refreshPayTotals : undefined}
         />
       )}
 
-      {(isAddModalOpen || editingEmployee) && (
+      {canWrite && (isAddModalOpen || editingEmployee) && (
         <AddEditEmployeeModal
           employee={editingEmployee}
           onClose={() => {
@@ -1159,7 +1076,7 @@ export default function EmployeesPage() {
         />
       )}
 
-      {deletingEmployee && (
+      {canWrite && deletingEmployee && (
         <DeleteConfirmModal
           employee={deletingEmployee}
           onClose={() => setDeletingEmployee(null)}
@@ -1180,9 +1097,10 @@ export default function EmployeesPage() {
         .modal-overlay { background: rgba(28,25,23,0.5); backdrop-filter: blur(2px); animation: overlayIn 0.18s ease both; }
         .modal-pop { animation: modalPop 0.22s cubic-bezier(0.16, 1, 0.3, 1) both; }
 
-        .stat-card, .panel, .btn-primary, .btn-secondary, .btn-link, .tbl-row {
+        .stat-card, .panel, .loan-card, .btn-primary, .btn-secondary, .btn-link, .tbl-row {
           transition: transform .18s ease, box-shadow .18s ease, background-color .18s ease, border-color .18s ease, color .18s ease;
         }
+        .loan-card:hover { border-color: ${COLORS.gold} !important; }
         .stat-card:hover { transform: translateY(-3px); box-shadow: 0 14px 28px -18px rgba(28,25,23,0.28); border-color: ${COLORS.gold} !important; }
         .panel:hover { box-shadow: 0 10px 26px -18px rgba(28,25,23,0.22); }
         .tbl-row:hover { background: ${COLORS.boneDim}77; }
@@ -1238,6 +1156,6 @@ export default function EmployeesPage() {
           .fade-in, .stat-card, .panel, .modal-pop, .modal-overlay, .btn-primary, .btn-secondary { animation: none !important; transition: none !important; }
         }
       `}</style>
-    </div>
+    </AppShell>
   );
 }

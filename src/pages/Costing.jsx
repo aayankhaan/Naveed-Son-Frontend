@@ -1,32 +1,29 @@
 // ========================================
 // Costing.jsx
-// Item Costing & Workstation Pricing page.
-// Manage the selling price charged to clients and department piece-rate wages
-// (Cutting, Stitching, Checking, Packing), calculating total workstation
-// labor costs and net profit per item.
-//
-// Articles are structured as:
-//   Product Name, Description, Workstation Prices, Selling Price
-//   + Sizes       (configurable, each optionally overrides price/rates, one default)
-//   + Dimensions  (configurable, each optionally overrides price/rates)
-//   + Variants    (Color/Design — plain text tags, no pricing)
-// Sizes, Dimensions, and Variants are managed independently of one another.
+// Manufacturing Catalog & Set Builder.
+// Articles own pricing; Sets bundle child Articles; Orders configure Article or Set purchases.
 // ========================================
 
 import { useState, useMemo, useEffect } from "react";
 import { FONT, COLORS } from "../constants/theme";
-import Sidebar from "../components/layout/Sidebar";
+import AppShell from "../components/layout/AppShell";
 import MiniStat from "../components/ui/MiniStat";
+import ModalLayer from "../components/ui/ModalLayer";
 import { SearchIcon, CloseIcon } from "../components/icons/CommonIcons";
 import { apiFetch } from "../lib/api";
+import { formatPKR, genId, emptyAddon, normalizeAddon } from "../lib/manufacturingPricing";
+import SetBuilderSection from "../components/costing/SetBuilderSection";
+import SetEditorPage from "../components/costing/SetEditorPage";
+import AddonConfigFields from "../components/costing/AddonConfigFields";
 
-const OVERRIDE_FIELDS = [
-  ["selling_price", "Sell"],
-  ["rate_cutting", "Cutting"],
-  ["rate_stitching", "Stitching"],
-  ["rate_checking", "Checking"],
-  ["rate_packing", "Packing"],
-];
+async function readApiError(res, fallback) {
+  try {
+    const data = await res.json();
+    return data.error || fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 function normaliseList(value) {
   if (Array.isArray(value)) return value;
@@ -41,11 +38,16 @@ function normaliseList(value) {
   return [];
 }
 
-function emptySize() {
-  return { size_name: "", is_default: false, selling_price: "", rate_cutting: "", rate_stitching: "", rate_checking: "", rate_packing: "" };
+function normalizeRateField(value) {
+  return value === "" || value == null ? null : Number(value);
 }
-function emptyDimension() {
-  return { dimension_name: "", selling_price: "", rate_cutting: "", rate_stitching: "", rate_checking: "", rate_packing: "" };
+
+function addonSellLabel(addon) {
+  const n = normalizeAddon(addon);
+  const bits = [];
+  if (n.sellingPrice != null) bits.push(`sell +${formatPKR(n.sellingPrice)}`);
+  if (n.addonRate != null) bits.push(`pay ${formatPKR(n.addonRate)}`);
+  return bits.length ? bits.join(" · ") : "—";
 }
 
 function calcItemCost(item) {
@@ -70,10 +72,6 @@ function calcItemCost(item) {
     profit,
     profitMargin,
   };
-}
-
-function formatPKR(n) {
-  return `PKR ${Math.round(n).toLocaleString()}`;
 }
 
 function PlusIcon() {
@@ -134,21 +132,10 @@ function LayersIcon() {
   );
 }
 
-function RulerIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-      <path d="M2 10.5l3.5-3.5 8 8-3.5 3.5-8-8z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
-      <path d="M5.8 7.2l1.1 1.1M7.6 5.4l1.1 1.1M9.4 3.6l1.1 1.1" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
-    </svg>
-  );
-}
-
 function ItemCostCard({ item, index, onEdit, onDelete }) {
   const calc = useMemo(() => calcItemCost(item), [item]);
   const isProfitable = calc.profit >= 0;
-  const sizes = item.sizes || [];
-  const dimensions = item.dimensions || [];
-  const variants = item.variants || [];
+  const addons = item.addons || [];
 
   return (
     <div
@@ -159,7 +146,7 @@ function ItemCostCard({ item, index, onEdit, onDelete }) {
         <div className="flex items-start justify-between gap-3 mb-3">
           <div>
             <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-[11px] font-mono font-bold px-2 py-0.5 rounded" style={{ background: COLORS.ink, color: COLORS.gold }}>
+              <span className="text-[11px] font-mono font-bold px-2 py-0.5 rounded" style={{ background: COLORS.inkSurface, color: COLORS.gold }}>
                 #{calc.id}
               </span>
               <h3 className="text-[15px] font-semibold" style={{ color: COLORS.ink }}>{calc.name}</h3>
@@ -192,53 +179,16 @@ function ItemCostCard({ item, index, onEdit, onDelete }) {
           </div>
         </div>
 
-        {(sizes.length > 0 || dimensions.length > 0 || variants.length > 0) && (
+        {addons.length > 0 && (
           <div className="rounded-xl p-3.5 mb-4" style={{ background: COLORS.goldSoft, border: `1px solid ${COLORS.border}` }}>
-            {sizes.length > 0 && (
-              <div className="mb-2 last:mb-0">
-                <div className="flex items-center gap-1.5 text-[10.5px] font-semibold uppercase tracking-wide mb-1.5" style={{ color: COLORS.goldDim }}>
-                  <LayersIcon /> Sizes <span className="font-normal normal-case" style={{ color: COLORS.graphiteLight }}>({sizes.length})</span>
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {sizes.slice(0, 5).map((s) => (
-                    <span key={s.size_id} className="text-[10.5px] px-2 py-1 rounded-md" style={{ background: COLORS.card, color: COLORS.graphite, border: `1px solid ${COLORS.border}` }}>
-                      {s.size_name}{s.is_default ? " ★" : ""}
-                    </span>
-                  ))}
-                  {sizes.length > 5 && <span className="text-[10.5px] px-2 py-1" style={{ color: COLORS.graphiteLight }}>+{sizes.length - 5} more</span>}
-                </div>
+            <div className="mb-2 last:mb-0">
+              <div className="flex items-center gap-1.5 text-[10.5px] font-semibold uppercase tracking-wide mb-1.5" style={{ color: COLORS.goldDim }}>
+                <WrenchIcon /> Add-ons <span className="font-normal normal-case" style={{ color: COLORS.graphiteLight }}>({addons.length})</span>
               </div>
-            )}
-            {dimensions.length > 0 && (
-              <div className="mb-2 last:mb-0">
-                <div className="flex items-center gap-1.5 text-[10.5px] font-semibold uppercase tracking-wide mb-1.5" style={{ color: COLORS.goldDim }}>
-                  <RulerIcon /> Dimensions <span className="font-normal normal-case" style={{ color: COLORS.graphiteLight }}>({dimensions.length})</span>
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {dimensions.slice(0, 5).map((d) => (
-                    <span key={d.dimension_id} className="text-[10.5px] px-2 py-1 rounded-md" style={{ background: COLORS.card, color: COLORS.graphite, border: `1px solid ${COLORS.border}` }}>
-                      {d.dimension_name}
-                    </span>
-                  ))}
-                  {dimensions.length > 5 && <span className="text-[10.5px] px-2 py-1" style={{ color: COLORS.graphiteLight }}>+{dimensions.length - 5} more</span>}
-                </div>
+              <div className="flex flex-wrap gap-1.5">
+                {addons.slice(0, 5).map((addon) => <span key={addon.id} className="text-[10.5px] px-2 py-1 rounded-md" style={{ background: COLORS.card, color: COLORS.graphite, border: `1px solid ${COLORS.border}` }}>{addon.name} (+{addonSellLabel(addon)})</span>)}
               </div>
-            )}
-            {variants.length > 0 && (
-              <div>
-                <div className="flex items-center gap-1.5 text-[10.5px] font-semibold uppercase tracking-wide mb-1.5" style={{ color: COLORS.goldDim }}>
-                  <TagIcon /> Variants (Color / Design) <span className="font-normal normal-case" style={{ color: COLORS.graphiteLight }}>({variants.length})</span>
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {variants.slice(0, 5).map((v) => (
-                    <span key={v.variant_id} className="text-[10.5px] px-2 py-1 rounded-md" style={{ background: COLORS.card, color: COLORS.graphite, border: `1px solid ${COLORS.border}` }}>
-                      {v.variant_name}
-                    </span>
-                  ))}
-                  {variants.length > 5 && <span className="text-[10.5px] px-2 py-1" style={{ color: COLORS.graphiteLight }}>+{variants.length - 5} more</span>}
-                </div>
-              </div>
-            )}
+            </div>
           </div>
         )}
 
@@ -289,28 +239,6 @@ function ItemCostCard({ item, index, onEdit, onDelete }) {
   );
 }
 
-// A single override-rate mini-grid, reused for both Sizes and Dimensions rows.
-function OverrideRatesGrid({ row, onChange }) {
-  return (
-    <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
-      {OVERRIDE_FIELDS.map(([field, label]) => (
-        <div key={field}>
-          <label className="form-label">{label} <span style={{ color: COLORS.graphiteLight }}>(PKR)</span></label>
-          <input
-            type="number"
-            min="0"
-            step="any"
-            className="form-input"
-            value={row[field] ?? ""}
-            onChange={(e) => onChange(field, e.target.value)}
-            placeholder="Use default"
-          />
-        </div>
-      ))}
-    </div>
-  );
-}
-
 function AddEditCostingModal({ item, onClose, onSave }) {
   const isEditing = Boolean(item?.id);
   const [name, setName] = useState(item?.name || "");
@@ -321,9 +249,7 @@ function AddEditCostingModal({ item, onClose, onSave }) {
   const [checkingRate, setCheckingRate] = useState(item?.checkingRate !== undefined ? item.checkingRate : "");
   const [packingRate, setPackingRate] = useState(item?.packingRate !== undefined ? item.packingRate : "");
 
-  const [sizes, setSizes] = useState(() => normaliseList(item?.sizes).map((s) => ({ ...emptySize(), ...s })));
-  const [dimensions, setDimensions] = useState(() => normaliseList(item?.dimensions).map((d) => ({ ...emptyDimension(), ...d })));
-  const [variants, setVariants] = useState(() => normaliseList(item?.variants).map((v) => v.variant_name ?? v));
+  const [addons, setAddons] = useState(() => normaliseList(item?.addons).map((addon) => ({ ...emptyAddon(), ...normalizeAddon(addon), id: addon.id || genId("ADDON") })));
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -348,41 +274,9 @@ function AddEditCostingModal({ item, onClose, onSave }) {
     });
   }, [sellingPrice, cuttingRate, stitchingRate, checkingRate, packingRate]);
 
-  // ---- Sizes ----
-  function addSize() {
-    setSizes((current) => [...current, emptySize()]);
-  }
-  function updateSize(index, field, value) {
-    setSizes((current) => current.map((row, i) => {
-      if (i !== index) return field === "is_default" && value ? { ...row, is_default: false } : row;
-      return { ...row, [field]: value };
-    }));
-  }
-  function removeSize(index) {
-    setSizes((current) => current.filter((_, i) => i !== index));
-  }
-
-  // ---- Dimensions ----
-  function addDimension() {
-    setDimensions((current) => [...current, emptyDimension()]);
-  }
-  function updateDimension(index, field, value) {
-    setDimensions((current) => current.map((row, i) => (i === index ? { ...row, [field]: value } : row)));
-  }
-  function removeDimension(index) {
-    setDimensions((current) => current.filter((_, i) => i !== index));
-  }
-
-  // ---- Variants (color/design — plain text) ----
-  function addVariant() {
-    setVariants((current) => [...current, ""]);
-  }
-  function updateVariantText(index, value) {
-    setVariants((current) => current.map((v, i) => (i === index ? value : v)));
-  }
-  function removeVariant(index) {
-    setVariants((current) => current.filter((_, i) => i !== index));
-  }
+  function addAddon() { setAddons((current) => [...current, emptyAddon()]); }
+  function updateAddon(index, field, value) { setAddons((current) => current.map((addon, addonIndex) => addonIndex === index ? { ...addon, [field]: value } : addon)); }
+  function removeAddon(index) { setAddons((current) => current.filter((_, addonIndex) => addonIndex !== index)); }
 
   async function handleSubmit(e) {
     e.preventDefault();
@@ -392,73 +286,44 @@ function AddEditCostingModal({ item, onClose, onSave }) {
     setError("");
 
     const payload = {
-      article_name: name.trim(),
-      article_description: description.trim(),
-      selling_price: Number(sellingPrice) || 0,
-      rate_cutting: Number(cuttingRate) || 0,
-      rate_stitching: Number(stitchingRate) || 0,
-      rate_checking: Number(checkingRate) || 0,
-      rate_packing: Number(packingRate) || 0,
-      sizes: sizes
-        .filter((s) => s.size_name?.trim())
-        .map((s) => ({
-          size_name: s.size_name.trim(),
-          is_default: Boolean(s.is_default),
-          selling_price: s.selling_price === "" || s.selling_price == null ? null : Number(s.selling_price),
-          rate_cutting: s.rate_cutting === "" || s.rate_cutting == null ? null : Number(s.rate_cutting),
-          rate_stitching: s.rate_stitching === "" || s.rate_stitching == null ? null : Number(s.rate_stitching),
-          rate_checking: s.rate_checking === "" || s.rate_checking == null ? null : Number(s.rate_checking),
-          rate_packing: s.rate_packing === "" || s.rate_packing == null ? null : Number(s.rate_packing),
-        })),
-      dimensions: dimensions
-        .filter((d) => d.dimension_name?.trim())
-        .map((d) => ({
-          dimension_name: d.dimension_name.trim(),
-          selling_price: d.selling_price === "" || d.selling_price == null ? null : Number(d.selling_price),
-          rate_cutting: d.rate_cutting === "" || d.rate_cutting == null ? null : Number(d.rate_cutting),
-          rate_stitching: d.rate_stitching === "" || d.rate_stitching == null ? null : Number(d.rate_stitching),
-          rate_checking: d.rate_checking === "" || d.rate_checking == null ? null : Number(d.rate_checking),
-          rate_packing: d.rate_packing === "" || d.rate_packing == null ? null : Number(d.rate_packing),
-        })),
-      variants: variants
-        .filter((v) => v?.trim())
-        .map((v) => ({ variant_name: v.trim() })),
+      ...(isEditing ? { id: item.id } : {}),
+      name: name.trim(),
+      description: description.trim(),
+      sellingPrice: Number(sellingPrice) || 0,
+      cuttingRate: Number(cuttingRate) || 0,
+      stitchingRate: Number(stitchingRate) || 0,
+      checkingRate: Number(checkingRate) || 0,
+      packingRate: Number(packingRate) || 0,
+      measurements: [],
+      addons: addons.filter((addon) => addon.name?.trim()).map((addon) => {
+        const n = normalizeAddon(addon);
+        return {
+          ...n,
+          name: n.name.trim(),
+          sellingPrice: normalizeRateField(n.sellingPrice),
+          cuttingRate: normalizeRateField(n.cuttingRate),
+          stitchingRate: normalizeRateField(n.stitchingRate),
+          checkingRate: normalizeRateField(n.checkingRate),
+          packingRate: normalizeRateField(n.packingRate),
+          addonRate: normalizeRateField(n.addonRate),
+          requiresStations: n.requiresStations,
+          afterStation: n.afterStation,
+        };
+      }),
     };
 
-    const numericId = isEditing ? item.id.replace("ART-", "") : null;
-    const url = isEditing
-      ? `/api/articles/${numericId}`
-      : "/api/articles";
-    const method = isEditing ? "PUT" : "POST";
-
     try {
-      const res = await apiFetch(url, {
-        method,
+      const res = await apiFetch(isEditing ? `/api/articles/${item.id}` : "/api/articles", {
+        method: isEditing ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-
-      const data = await res.json();
-
       if (!res.ok) {
-        setError(data.error || "Something went wrong");
-        setSaving(false);
+        setError(await readApiError(res, "Could not save article"));
         return;
       }
-
-      onSave({
-        id: `ART-${data.article_id}`,
-        name: data.article_name,
-        description: data.article_description || "",
-        sellingPrice: Number(data.selling_price),
-        cuttingRate: Number(data.rate_cutting),
-        stitchingRate: Number(data.rate_stitching),
-        checkingRate: Number(data.rate_checking),
-        packingRate: Number(data.rate_packing),
-        sizes: normaliseList(data.sizes),
-        dimensions: normaliseList(data.dimensions),
-        variants: normaliseList(data.variants),
-      });
+      const saved = await res.json();
+      onSave(saved);
     } catch (err) {
       console.error(err);
       setError("Could not reach the server");
@@ -468,7 +333,7 @@ function AddEditCostingModal({ item, onClose, onSave }) {
   }
 
   return (
-    <div className="modal-overlay fixed inset-0 z-60 flex items-center justify-center p-3 sm:p-6" onClick={onClose}>
+    <ModalLayer onClose={onClose} zClass="z-[90]">
       <div
         className="modal-pop w-full max-w-2xl max-h-[92vh] overflow-y-auto rounded-2xl"
         style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}
@@ -565,95 +430,36 @@ function AddEditCostingModal({ item, onClose, onSave }) {
               onChange={(e) => setSellingPrice(e.target.value)}
               placeholder="e.g. 850"
             />
+            <p className="text-[10.5px] mt-1" style={{ color: COLORS.graphiteLight }}>
+              Catalog hint — customer price can be overridden on the order. Size is set on the order.
+            </p>
           </div>
 
-          {/* ---------------- Sizes ---------------- */}
           <section className="rounded-2xl p-4 sm:p-5 mb-5" style={{ background: COLORS.boneDim, border: `1px solid ${COLORS.border}` }}>
             <div className="flex items-center justify-between gap-3 mb-4">
               <div>
-                <h4 className="text-[12px] font-semibold uppercase tracking-wide flex items-center gap-1.5" style={{ color: COLORS.ink }}><LayersIcon /> Sizes</h4>
-                <p className="text-[11px] mt-1" style={{ color: COLORS.graphiteLight }}>e.g. Single, 50 Double. Mark one as default. Empty price fields inherit the product defaults.</p>
+                <h4 className="text-[12px] font-semibold uppercase tracking-wide flex items-center gap-1.5" style={{ color: COLORS.ink }}><WrenchIcon /> Add-ons</h4>
+                <p className="text-[11px] mt-1" style={{ color: COLORS.graphiteLight }}>Extras like Button — paid separately in daily entry after required stations.</p>
               </div>
-              <button type="button" className="btn-primary shrink-0 text-[11.5px] font-semibold px-3.5 py-2 rounded-lg" style={{ background: COLORS.gold, color: COLORS.ink }} onClick={addSize}>+ Add size</button>
+              <button type="button" className="btn-primary shrink-0 text-[11.5px] font-semibold px-3.5 py-2 rounded-lg" style={{ background: COLORS.gold, color: COLORS.inkSurface }} onClick={addAddon}>+ Add add-on</button>
             </div>
-            {sizes.length === 0 ? (
-              <p className="text-[11.5px]" style={{ color: COLORS.graphiteLight }}>No sizes yet. This product will use its default pricing only.</p>
-            ) : sizes.map((size, index) => (
-              <div key={index} className="rounded-xl overflow-hidden mb-4 last:mb-0" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+            {addons.length === 0 ? (
+              <p className="text-[11.5px]" style={{ color: COLORS.graphiteLight }}>No add-ons yet.</p>
+            ) : addons.map((addon, index) => (
+              <div key={addon.id || index} className="rounded-xl overflow-hidden mb-4 last:mb-0" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
                 <div className="flex items-center justify-between px-4 py-2.5" style={{ background: COLORS.goldSoft, borderBottom: `1px solid ${COLORS.border}` }}>
-                  <span className="text-[11px] font-semibold uppercase tracking-wide" style={{ color: COLORS.goldDim }}>Size {index + 1}</span>
-                  <button type="button" className="text-[11px] font-semibold px-2 py-1 rounded-md" style={{ color: COLORS.rust }} onClick={() => removeSize(index)}>Remove</button>
-                </div>
-                <div className="p-4">
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-4">
-                    <div className="sm:col-span-2">
-                      <label className="form-label">Size Name</label>
-                      <input className="form-input" value={size.size_name} onChange={(e) => updateSize(index, "size_name", e.target.value)} placeholder="e.g. Single" />
-                    </div>
-                    <div className="flex items-end pb-1.5">
-                      <label className="flex items-center gap-2 text-[12px] font-medium" style={{ color: COLORS.graphite }}>
-                        <input type="checkbox" checked={Boolean(size.is_default)} onChange={(e) => updateSize(index, "is_default", e.target.checked)} />
-                        Default size
-                      </label>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2 mt-1 mb-2"><span className="h-px flex-1" style={{ background: COLORS.border }} /><span className="text-[10px] font-semibold uppercase tracking-wide" style={{ color: COLORS.graphiteLight }}>Optional price / rate overrides</span><span className="h-px flex-1" style={{ background: COLORS.border }} /></div>
-                  <OverrideRatesGrid row={size} onChange={(field, value) => updateSize(index, field, value)} />
-                </div>
-              </div>
-            ))}
-          </section>
-
-          {/* ---------------- Dimensions ---------------- */}
-          <section className="rounded-2xl p-4 sm:p-5 mb-5" style={{ background: COLORS.boneDim, border: `1px solid ${COLORS.border}` }}>
-            <div className="flex items-center justify-between gap-3 mb-4">
-              <div>
-                <h4 className="text-[12px] font-semibold uppercase tracking-wide flex items-center gap-1.5" style={{ color: COLORS.ink }}><RulerIcon /> Dimensions</h4>
-                <p className="text-[11px] mt-1" style={{ color: COLORS.graphiteLight }}>e.g. "140 x 200 | 60x70". Empty price fields inherit the product defaults.</p>
-              </div>
-              <button type="button" className="btn-primary shrink-0 text-[11.5px] font-semibold px-3.5 py-2 rounded-lg" style={{ background: COLORS.gold, color: COLORS.ink }} onClick={addDimension}>+ Add dimension</button>
-            </div>
-            {dimensions.length === 0 ? (
-              <p className="text-[11.5px]" style={{ color: COLORS.graphiteLight }}>No dimensions yet. This product will use its default pricing only.</p>
-            ) : dimensions.map((dimension, index) => (
-              <div key={index} className="rounded-xl overflow-hidden mb-4 last:mb-0" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
-                <div className="flex items-center justify-between px-4 py-2.5" style={{ background: COLORS.goldSoft, borderBottom: `1px solid ${COLORS.border}` }}>
-                  <span className="text-[11px] font-semibold uppercase tracking-wide" style={{ color: COLORS.goldDim }}>Dimension {index + 1}</span>
-                  <button type="button" className="text-[11px] font-semibold px-2 py-1 rounded-md" style={{ color: COLORS.rust }} onClick={() => removeDimension(index)}>Remove</button>
+                  <span className="text-[11px] font-semibold uppercase tracking-wide" style={{ color: COLORS.goldDim }}>Add-on {index + 1}</span>
+                  <button type="button" className="text-[11px] font-semibold px-2 py-1 rounded-md" style={{ color: COLORS.rust }} onClick={() => removeAddon(index)}>Remove</button>
                 </div>
                 <div className="p-4">
                   <div className="mb-4">
-                    <label className="form-label">Dimension</label>
-                    <input className="form-input" value={dimension.dimension_name} onChange={(e) => updateDimension(index, "dimension_name", e.target.value)} placeholder="e.g. 200 x 200 | 60x70 + 2" />
+                    <label className="form-label">Add-on name</label>
+                    <input className="form-input" value={addon.name || ""} onChange={(e) => updateAddon(index, "name", e.target.value)} placeholder="e.g. Button" />
                   </div>
-                  <div className="flex items-center gap-2 mt-1 mb-2"><span className="h-px flex-1" style={{ background: COLORS.border }} /><span className="text-[10px] font-semibold uppercase tracking-wide" style={{ color: COLORS.graphiteLight }}>Optional price / rate overrides</span><span className="h-px flex-1" style={{ background: COLORS.border }} /></div>
-                  <OverrideRatesGrid row={dimension} onChange={(field, value) => updateDimension(index, field, value)} />
+                  <AddonConfigFields addon={addon} onChange={(field, value) => updateAddon(index, field, value)} />
                 </div>
               </div>
             ))}
-          </section>
-
-          {/* ---------------- Variants (Color / Design) ---------------- */}
-          <section className="rounded-2xl p-4 sm:p-5 mb-6" style={{ background: COLORS.boneDim, border: `1px solid ${COLORS.border}` }}>
-            <div className="flex items-center justify-between gap-3 mb-4">
-              <div>
-                <h4 className="text-[12px] font-semibold uppercase tracking-wide flex items-center gap-1.5" style={{ color: COLORS.ink }}><TagIcon /> Variants (Color / Design)</h4>
-                <p className="text-[11px] mt-1" style={{ color: COLORS.graphiteLight }}>Simple text values, e.g. Olive, Yellow, White Floral. No pricing — variants are descriptive only.</p>
-              </div>
-              <button type="button" className="btn-primary shrink-0 text-[11.5px] font-semibold px-3.5 py-2 rounded-lg" style={{ background: COLORS.gold, color: COLORS.ink }} onClick={addVariant}>+ Add variant</button>
-            </div>
-            {variants.length === 0 ? (
-              <p className="text-[11.5px]" style={{ color: COLORS.graphiteLight }}>No variants yet.</p>
-            ) : (
-              <div className="flex flex-col gap-2">
-                {variants.map((variant, index) => (
-                  <div key={index} className="flex items-center gap-2">
-                    <input className="form-input" value={variant} onChange={(e) => updateVariantText(index, e.target.value)} placeholder="e.g. Olive Green" />
-                    <button type="button" className="text-[11px] font-semibold px-2 py-2 rounded-md shrink-0" style={{ color: COLORS.rust }} onClick={() => removeVariant(index)}>Remove</button>
-                  </div>
-                ))}
-              </div>
-            )}
           </section>
 
           <div className="rounded-xl p-4 mb-6" style={{ background: COLORS.goldSoft, border: `1px solid ${COLORS.border}` }}>
@@ -699,22 +505,35 @@ function AddEditCostingModal({ item, onClose, onSave }) {
               type="submit"
               disabled={!name.trim() || saving}
               className="btn-primary text-[12.5px] font-semibold px-4 py-2 rounded-lg"
-              style={{ background: COLORS.gold, color: COLORS.ink, opacity: name.trim() ? 1 : 0.5 }}
+              style={{ background: COLORS.gold, color: COLORS.inkSurface, opacity: name.trim() ? 1 : 0.5 }}
             >
               {saving ? "Saving..." : isEditing ? "Save Changes" : "Add Product Costing"}
             </button>
           </div>
         </form>
       </div>
-    </div>
+    </ModalLayer>
   );
 }
 
 function DeleteCostingModal({ item, onClose, onConfirm }) {
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState("");
   if (!item) return null;
 
+  async function handleConfirm() {
+    setDeleting(true);
+    setError("");
+    try {
+      await onConfirm(item.id);
+    } catch (err) {
+      setError(err?.message || "Could not delete");
+      setDeleting(false);
+    }
+  }
+
   return (
-    <div className="modal-overlay fixed inset-0 z-70 flex items-center justify-center p-4" onClick={onClose}>
+    <ModalLayer onClose={onClose} zClass="z-[90]" alignClass="items-center justify-center p-4">
       <div
         className="modal-pop w-full max-w-md rounded-2xl p-6"
         style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}
@@ -731,62 +550,70 @@ function DeleteCostingModal({ item, onClose, onConfirm }) {
         <p className="text-[13px] mb-6" style={{ color: COLORS.graphite }}>
           Are you sure you want to remove costing for <strong style={{ color: COLORS.ink }}>{item.name}</strong> ({item.id})?
         </p>
+        {error && <p className="text-[12px] mb-3" style={{ color: COLORS.rust }}>{error}</p>}
         <div className="flex items-center justify-end gap-3">
           <button
             type="button"
             className="btn-secondary text-[12.5px] font-semibold px-4 py-2 rounded-lg"
             style={{ border: `1px solid ${COLORS.border}`, color: COLORS.graphite }}
             onClick={onClose}
+            disabled={deleting}
           >
             Cancel
           </button>
           <button
             type="button"
             className="btn-primary text-[12.5px] font-semibold px-4 py-2 rounded-lg"
-            style={{ background: COLORS.rust, color: COLORS.card }}
-            onClick={() => onConfirm(item.id)}
+            style={{ background: COLORS.rust, color: COLORS.card, opacity: deleting ? 0.7 : 1 }}
+            onClick={handleConfirm}
+            disabled={deleting}
           >
-            Delete Item
+            {deleting ? "Deleting…" : "Delete Item"}
           </button>
         </div>
       </div>
-    </div>
+    </ModalLayer>
   );
 }
 
 export default function CostingPage() {
-  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [catalogTab, setCatalogTab] = useState("articles");
   const [search, setSearch] = useState("");
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [editingItem, setEditingItem] = useState(null);
   const [deletingItem, setDeletingItem] = useState(null);
 
   const [costingItems, setCostingItems] = useState([]);
+  const [sets, setSets] = useState([]);
+  const [setEditor, setSetEditor] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
 
   useEffect(() => {
-    async function fetchArticles() {
+    let cancelled = false;
+    async function loadCatalog() {
+      setLoading(true);
+      setLoadError("");
       try {
-        const res = await apiFetch("/api/articles");
-        const data = await res.json();
-        const mapped = data.map((a) => ({
-          id: `ART-${a.article_id}`,
-          name: a.article_name,
-          description: a.article_description || "",
-          sellingPrice: Number(a.selling_price),
-          cuttingRate: Number(a.rate_cutting),
-          stitchingRate: Number(a.rate_stitching),
-          checkingRate: Number(a.rate_checking),
-          packingRate: Number(a.rate_packing),
-          sizes: normaliseList(a.sizes),
-          dimensions: normaliseList(a.dimensions),
-          variants: normaliseList(a.variants),
-        }));
-        setCostingItems(mapped);
+        const [articlesRes, setsRes] = await Promise.all([
+          apiFetch("/api/articles"),
+          apiFetch("/api/sets"),
+        ]);
+        if (!articlesRes.ok) throw new Error(await readApiError(articlesRes, "Failed to load articles"));
+        if (!setsRes.ok) throw new Error(await readApiError(setsRes, "Failed to load sets"));
+        const [articles, setsData] = await Promise.all([articlesRes.json(), setsRes.json()]);
+        if (cancelled) return;
+        setCostingItems(Array.isArray(articles) ? articles : []);
+        setSets(Array.isArray(setsData) ? setsData : []);
       } catch (err) {
-        console.error("Failed to fetch articles", err);
+        console.error(err);
+        if (!cancelled) setLoadError(err.message || "Could not load catalog from server");
+      } finally {
+        if (!cancelled) setLoading(false);
       }
     }
-    fetchArticles();
+    loadCatalog();
+    return () => { cancelled = true; };
   }, []);
 
   const calculatedItems = useMemo(() => costingItems.map(calcItemCost), [costingItems]);
@@ -819,9 +646,7 @@ export default function CostingPage() {
   function handleSaveCosting(data) {
     setCostingItems((prev) => {
       const exists = prev.some((i) => i.id === data.id);
-      if (exists) {
-        return prev.map((i) => (i.id === data.id ? { ...i, ...data } : i));
-      }
+      if (exists) return prev.map((i) => (i.id === data.id ? data : i));
       return [data, ...prev];
     });
     setIsAddModalOpen(false);
@@ -829,62 +654,103 @@ export default function CostingPage() {
   }
 
   async function handleDeleteCosting(id) {
-    const numericId = id.replace("ART-", "");
-    try {
-      const res = await apiFetch(`/api/articles/${numericId}`, {
-        method: "DELETE",
-      });
-      if (!res.ok) {
-        const data = await res.json();
-        console.error(data.error || "Failed to delete article");
-        return;
-      }
-      setCostingItems((prev) => prev.filter((i) => i.id !== id));
-      setDeletingItem(null);
-    } catch (err) {
-      console.error(err);
-    }
+    const res = await apiFetch(`/api/articles/${id}`, { method: "DELETE" });
+    if (!res.ok) throw new Error(await readApiError(res, "Failed to delete article"));
+    setCostingItems((prev) => prev.filter((item) => item.id !== id));
+    setDeletingItem(null);
+  }
+
+  async function handleSaveSet(data) {
+    const isEdit = Boolean(data.id && sets.some((s) => s.id === data.id));
+    const res = await apiFetch(isEdit ? `/api/sets/${data.id}` : "/api/sets", {
+      method: isEdit ? "PUT" : "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    if (!res.ok) throw new Error(await readApiError(res, "Failed to save set"));
+    const saved = await res.json();
+    setSets((prev) => {
+      const exists = prev.some((s) => s.id === saved.id);
+      if (exists) return prev.map((s) => (s.id === saved.id ? saved : s));
+      return [saved, ...prev];
+    });
+    setSetEditor(null);
+  }
+
+  async function handleDeleteSet(id) {
+    const res = await apiFetch(`/api/sets/${id}`, { method: "DELETE" });
+    if (!res.ok) throw new Error(await readApiError(res, "Failed to delete set"));
+    setSets((prev) => prev.filter((s) => s.id !== id));
   }
 
   return (
-    <div className="min-h-screen w-full flex" style={{ background: COLORS.bone, fontFamily: FONT }}>
-      <Sidebar mobileOpen={mobileNavOpen} onClose={() => setMobileNavOpen(false)} />
-
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center justify-between gap-3 px-5 md:px-8 py-4 sticky top-0 z-30 backdrop-blur" style={{ background: `${COLORS.bone}F2`, borderBottom: `1px solid ${COLORS.border}` }}>
-          <div className="flex items-center gap-3 min-w-0">
-            <button type="button" className="md:hidden p-2 rounded-lg btn-secondary shrink-0" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }} onClick={() => setMobileNavOpen(true)} aria-label="Open navigation">
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M2 4h12M2 8h12M2 12h12" stroke={COLORS.ink} strokeWidth="1.4" strokeLinecap="round" />
-              </svg>
-            </button>
-            <div className="min-w-0">
-              <h1 className="text-xl font-semibold truncate" style={{ color: COLORS.ink }}>Item Costing &amp; Workstation Pricing</h1>
-              <p className="text-[12px]" style={{ color: COLORS.graphiteLight }}>Set selling price and workstation piece-rates (Cutting, Stitching, Checking, Packing)</p>
+    <AppShell
+      title={setEditor ? (setEditor.id ? "Edit set" : "New set") : "Item Costing"}
+      subtitle={setEditor ? "Step-by-step set builder" : "Articles and sets with workstation pricing"}
+      maxWidth="80rem"
+      actions={
+        !setEditor && catalogTab === "articles" ? (
+          <button
+            type="button"
+            className="btn-primary inline-flex items-center gap-1.5 text-[12.5px] font-semibold px-3.5 py-2 rounded-xl shrink-0"
+            style={{ background: COLORS.gold, color: COLORS.inkSurface }}
+            onClick={() => setIsAddModalOpen(true)}
+          >
+            <PlusIcon /> Add Article
+          </button>
+        ) : null
+      }
+    >
+        {setEditor ? (
+          <SetEditorPage
+            initialSet={setEditor}
+            onSave={handleSaveSet}
+            onCancel={() => setSetEditor(null)}
+          />
+        ) : (
+        <>
+          {loading ? (
+            <div className="rounded-2xl p-12 text-center" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+              <p className="text-[13px]" style={{ color: COLORS.graphiteLight }}>Loading catalog…</p>
             </div>
+          ) : loadError ? (
+            <div className="rounded-2xl p-8 text-center" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+              <p className="text-[14px] font-semibold mb-2" style={{ color: COLORS.rust }}>Could not load catalog</p>
+              <p className="text-[13px] mb-4" style={{ color: COLORS.graphite }}>{loadError}</p>
+              <button
+                type="button"
+                className="text-[12.5px] font-semibold px-4 py-2 rounded-lg"
+                style={{ background: COLORS.gold, color: COLORS.inkSurface }}
+                onClick={() => window.location.reload()}
+              >
+                Retry
+              </button>
+            </div>
+          ) : (
+          <>
+          <div className="segmented mb-6">
+            {[
+              ["articles", "Articles"],
+              ["sets", "Sets"],
+            ].map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setCatalogTab(id)}
+                style={{
+                  background: catalogTab === id ? COLORS.inkSurface : "transparent",
+                  color: catalogTab === id ? COLORS.onDark : COLORS.graphite,
+                }}
+              >
+                {label}
+              </button>
+            ))}
           </div>
-          <div className="flex items-center gap-3 shrink-0">
-            <button
-              type="button"
-              className="btn-primary inline-flex items-center gap-1.5 text-[12.5px] font-semibold px-3.5 py-2 rounded-lg shrink-0"
-              style={{ background: COLORS.gold, color: COLORS.ink }}
-              onClick={() => setIsAddModalOpen(true)}
-            >
-              <PlusIcon /> Add item costing
-            </button>
-            <div className="hidden sm:flex flex-col items-end leading-tight border-l pl-3" style={{ borderColor: COLORS.border }}>
-              <span className="text-[13px] font-medium" style={{ color: COLORS.ink }}>Admin</span>
-              <span className="text-[11px]" style={{ color: COLORS.graphiteLight }}>Administrator</span>
-            </div>
-            <div className="w-9 h-9 rounded-full flex items-center justify-center text-[13px] font-semibold shrink-0" style={{ background: COLORS.ink, color: COLORS.gold, border: `2px solid ${COLORS.goldSoft}` }}>
-              A
-            </div>
-          </div>
-        </div>
 
-        <div className="p-5 md:p-8 max-w-7xl mx-auto">
+          {catalogTab === "articles" && (
+          <>
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-            <MiniStat index={0} icon={<TagIcon />} label="Total Costed Items" value={totalProducts} sub="Active products" />
+            <MiniStat index={0} icon={<TagIcon />} label="Total Articles" value={totalProducts} sub="Active products" />
             <MiniStat index={1} icon={<WrenchIcon />} label="Avg Station Labor" value={formatPKR(avgStationLabor)} sub="across 4 stations" />
             <MiniStat index={2} icon={<ProfitIcon />} label="Avg Profit / Item" value={formatPKR(avgProfit)} sub="net profit margin" />
             <MiniStat index={3} icon={<LayersIcon />} label="Avg Margin" value={`${avgMargin.toFixed(1)}%`} sub="overall average" />
@@ -895,7 +761,7 @@ export default function CostingPage() {
               <SearchIcon />
               <input type="text" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search product name or Article ID" />
             </div>
-            <span className="text-[11.5px] ml-auto" style={{ color: COLORS.graphiteLight }}>{filtered.length} products found</span>
+            <span className="text-[11.5px] ml-auto" style={{ color: COLORS.graphiteLight }}>{filtered.length} articles found</span>
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -910,12 +776,37 @@ export default function CostingPage() {
             ))}
             {filtered.length === 0 && (
               <div className="lg:col-span-2 rounded-2xl p-12 text-center" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
-                <p className="text-[13px]" style={{ color: COLORS.graphiteLight }}>No products match your search query.</p>
+                <p className="text-[13px]" style={{ color: COLORS.graphiteLight }}>
+                  {search.trim() ? "No articles match your search query." : "No articles yet — click Add Article to create one."}
+                </p>
               </div>
             )}
           </div>
-        </div>
-      </div>
+          </>
+          )}
+
+          {catalogTab === "sets" && (
+            <>
+              <div className="flex flex-wrap items-center gap-3 mb-6">
+                <div className="search-wrap">
+                  <SearchIcon />
+                  <input type="text" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search set name or ID" />
+                </div>
+                <span className="text-[11.5px] ml-auto" style={{ color: COLORS.graphiteLight }}>{sets.length} sets</span>
+              </div>
+              <SetBuilderSection
+                sets={sets}
+                search={search}
+                onCreate={() => setSetEditor({})}
+                onEdit={(s) => setSetEditor(s)}
+                onDelete={handleDeleteSet}
+              />
+            </>
+          )}
+          </>
+          )}
+        </>
+        )}
 
       {(isAddModalOpen || editingItem) && (
         <AddEditCostingModal
@@ -985,6 +876,6 @@ export default function CostingPage() {
         ::-webkit-scrollbar-thumb { background: ${COLORS.boneBorder}; border-radius: 8px; }
         ::-webkit-scrollbar-thumb:hover { background: ${COLORS.graphiteLight}; }
       `}</style>
-    </div>
+    </AppShell>
   );
 }

@@ -1,17 +1,48 @@
 // ========================================
 // DailyEntry.jsx
-// Bulk Daily Work Data & Attendance Entry page.
-// Wired to the real backend: employees + articles are fetched live,
-// and each day's batch is saved to / loaded from Postgres (production_logs +
-// daily_batches), with permanent lock enforcement handled server-side.
+// Floor board + per-employee add data.
+// Pick a Karachi date: empty → add form; has data → locked batch.
 // ========================================
 
-import { useState, useMemo, useEffect, Fragment } from "react";
+import { useState, useMemo, useEffect, Fragment, useCallback } from "react";
 import { FONT, COLORS } from "../constants/theme";
-import Sidebar from "../components/layout/Sidebar";
+import AppShell from "../components/layout/AppShell";
 import MiniStat from "../components/ui/MiniStat";
-import { SearchIcon, CloseIcon } from "../components/icons/CommonIcons";
-import { API_BASE, apiFetch } from "../lib/api";
+import { SearchIcon } from "../components/icons/CommonIcons";
+import { apiFetch } from "../lib/api";
+import {
+  STATION_ORDER,
+  skipMap,
+  previousStation,
+  emptyStationTotals,
+  liveStationTotals,
+  liveAddonTotals,
+  availableForStation,
+  availableForAddon,
+  describePipelineStatus,
+  stationWipTotals,
+  lineSelectedAddons,
+  findLineAddon,
+  addonsForStation,
+  addonWorkStation,
+  buildSetPackContext,
+  completeSetsReadyForPack,
+  qtyPerSetOf,
+  setGroupKey,
+  availableSetPackSets,
+  setPackCatchUpNeeds,
+  lineSetMeta,
+  partNameOf,
+  addonWipQty,
+} from "../lib/productionFlow";
+import {
+  karachiTodayISO,
+  formatKarachiDMY,
+  toIsoDateOnly,
+  catchUpWindow,
+  missingDaysInWindow,
+  addDaysISO,
+} from "../lib/karachiDate";
 
 const STATION_COLORS = {
   Cutting: COLORS.graphiteLight,
@@ -20,50 +51,117 @@ const STATION_COLORS = {
   Packing: COLORS.green,
 };
 
+const STATION_SHORT = { Cutting: "Cut", Stitching: "Sti", Checking: "Che", Packing: "Pac" };
+const LOOKBACK_DAYS = 31;
+
 function initials(name) {
   if (!name) return "E";
   return name.split(" ").filter(Boolean).map((p) => p[0]).slice(0, 2).join("").toUpperCase();
-}
-
-function getImageUrl(imagePath) {
-  if (!imagePath) return "";
-  if (imagePath.startsWith("http") || imagePath.startsWith("blob:")) return imagePath;
-  return `${API_BASE}${imagePath}`;
 }
 
 function formatPKR(n) {
   return `PKR ${Math.round(n).toLocaleString()}`;
 }
 
-function getFormattedDate(offsetDays = 0) {
-  const d = new Date();
-  d.setDate(d.getDate() - offsetDays);
-  return d.toISOString().split("T")[0];
+async function readApiError(res, fallback) {
+  try {
+    const data = await res.json();
+    return data.error || fallback;
+  } catch {
+    return fallback;
+  }
 }
 
-function PlusIcon() {
-  return (
-    <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
-      <path d="M7 1.5v11M1.5 7h11" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-    </svg>
-  );
+function emptyEntry() {
+  return {
+    orderId: null,
+    orderLineId: null,
+    variantId: null,
+    addonId: null,
+    qty: "",
+    defects: "",
+    packItemKey: null,
+    setGroupKey: null,
+  };
 }
 
-function UploadIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
-      <path d="M8 11V2M4.5 5.5L8 2l3.5 3.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-      <path d="M2.5 12.5v1.5c0 .6.4 1 1 1h9c.6 0 1-.4 1-1v-1.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
-    </svg>
-  );
+/** Packing picker: one option per set + standalone articles. */
+function buildPackItems(order) {
+  const lines = order?.lines || [];
+  const items = [];
+  const seen = new Set();
+  for (const line of lines) {
+    const gk = setGroupKey(line);
+    if (gk) {
+      if (seen.has(gk)) continue;
+      seen.add(gk);
+      const groupLines = lines.filter((l) => setGroupKey(l) === gk);
+      const meta = lineSetMeta(line) || {};
+      const size = meta.sizeText || meta.configurationName || line.dimension_name || "";
+      items.push({
+        type: "set",
+        key: `set:${gk}`,
+        groupKey: gk,
+        lines: groupLines,
+        primaryLine: groupLines[0],
+        label: `${meta.setName || "Set"}${size ? ` · ${size}` : ""}`,
+        setName: meta.setName || "Set",
+      });
+    } else if (!skipMap(line).Packing) {
+      items.push({
+        type: "article",
+        key: `art:${line.order_line_id}`,
+        line,
+        label: `${line.article_name}${line.dimension_name ? ` · ${line.dimension_name}` : ""}`,
+      });
+    }
+  }
+  return items;
 }
 
-function CheckIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
-      <path d="M3.5 8.5l3 3 6-6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  );
+function packItemFromEntry(order, entry) {
+  if (!order || !entry) return null;
+  const items = buildPackItems(order);
+  if (entry.packItemKey) {
+    return items.find((i) => i.key === entry.packItemKey) || null;
+  }
+  if (entry.setGroupKey) {
+    return items.find((i) => i.type === "set" && i.groupKey === entry.setGroupKey) || null;
+  }
+  if (entry.orderLineId) {
+    const line = (order.lines || []).find((l) => l.order_line_id === Number(entry.orderLineId));
+    const gk = line ? setGroupKey(line) : null;
+    if (gk) return items.find((i) => i.type === "set" && i.groupKey === gk) || null;
+    return items.find((i) => i.type === "article" && i.line.order_line_id === Number(entry.orderLineId)) || null;
+  }
+  return null;
+}
+
+function designNameFromVariant(line, variantId) {
+  const v = (line?.variants || []).find((x) => x.variant_id === variantId);
+  return String(v?.variant_name || "Default").trim() || "Default";
+}
+
+function matchVariantByDesign(line, designName) {
+  const name = String(designName || "Default").trim() || "Default";
+  const vars = line?.variants || [];
+  return vars.find((v) => String(v.variant_name || "Default").trim() === name) || vars[0] || null;
+}
+
+/** Rate paid per complete set packed (sum of part packing rates × qty/set). */
+function setPackRatePerSet(groupLines) {
+  return (groupLines || []).reduce((sum, l) => {
+    return sum + (Number(l.packing_rate) || 0) * qtyPerSetOf(l);
+  }, 0);
+}
+
+function emptyDraft(targetDate) {
+  return {
+    targetDate: targetDate || karachiTodayISO(),
+    isLeave: false,
+    addingMore: false,
+    entries: [emptyEntry()],
+  };
 }
 
 function UsersIcon() {
@@ -90,1234 +188,1658 @@ function BanknoteIcon() {
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
       <rect x="1.5" y="4" width="13" height="8.5" rx="1.6" stroke="currentColor" strokeWidth="1.3" />
       <circle cx="8" cy="8.25" r="2" stroke="currentColor" strokeWidth="1.2" />
-      <path d="M3.3 6v.01M12.7 10.5v.01" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
     </svg>
   );
 }
 
-function CalendarIcon() {
+function PlusIcon() {
   return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
-      <rect x="2" y="3.2" width="12" height="10.8" rx="1.6" stroke="currentColor" strokeWidth="1.3" />
-      <path d="M2 6.4h12M5 1.7v2.4M11 1.7v2.4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+    <svg width="13" height="13" viewBox="0 0 14 14" fill="none">
+      <path d="M7 1.5v11M1.5 7h11" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
     </svg>
   );
 }
 
-function LockIcon() {
+function stationRate(line, station) {
+  if (!line) return 0;
+  const map = {
+    Cutting: line.cutting_rate,
+    Stitching: line.stitching_rate,
+    Checking: line.checking_rate,
+    Packing: line.packing_rate,
+  };
+  return Number(map[station]) || 0;
+}
+
+function entryRate(line, station, addonId) {
+  if (addonId) {
+    const ad = findLineAddon(line, addonId);
+    return Number(ad?.addonRate) || 0;
+  }
+  return stationRate(line, station);
+}
+
+function clampQtyToHeadroom(raw, headroom) {
+  if (raw === "" || raw == null) return "";
+  let n = Number(raw);
+  if (Number.isNaN(n) || n < 0) return "0";
+  if (headroom != null) {
+    if (headroom <= 0) return "";
+    n = Math.min(n, headroom);
+  }
+  return String(n);
+}
+
+function StationPills({ line, totals, orderQty, addonTotals }) {
+  const skips = skipMap(line);
+  const live = totals || emptyStationTotals();
+  const wip = stationWipTotals(line, live);
+  const enabled = STATION_ORDER.filter((s) => !skips[s]);
+  const last = enabled[enabled.length - 1];
+  const addons = lineSelectedAddons(line);
   return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
-      <rect x="3" y="7" width="10" height="7.5" rx="1.6" stroke="currentColor" strokeWidth="1.4" />
-      <path d="M5 7V4.5a3 3 0 0 1 6 0V7" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
-    </svg>
+    <div className="flex flex-wrap items-center gap-1">
+      {STATION_ORDER.map((s, i) => {
+        const skipped = skips[s];
+        const qty = Number(wip[s]) || 0;
+        const finishedHere = s === last;
+        const over = !skipped && finishedHere && (Number(live[s]) || 0) > (Number(orderQty) || 0);
+        const afterPills = addons.filter((a) => addonWorkStation(a) === s);
+        return (
+          <Fragment key={s}>
+            {i > 0 && <span className="text-[10px]" style={{ color: COLORS.graphiteLight }}>→</span>}
+            <span
+              className="text-[10px] font-semibold px-2 py-0.5 rounded"
+              style={{
+                background: skipped ? COLORS.boneDim : over ? COLORS.goldSoft : COLORS.card,
+                color: skipped ? COLORS.graphiteLight : COLORS.ink,
+                textDecoration: skipped ? "line-through" : "none",
+                border: `1px solid ${COLORS.border}`,
+              }}
+            >
+              {STATION_SHORT[s]} {skipped ? "—" : qty.toLocaleString()}
+            </span>
+            {afterPills.map((a) => {
+              const sitting = addonWipQty(a, live, addonTotals?.[a.id]);
+              return (
+              <Fragment key={a.id}>
+                <span className="text-[10px]" style={{ color: COLORS.graphiteLight }}>→</span>
+                <span
+                  className="text-[10px] font-semibold px-2 py-0.5 rounded"
+                  style={{
+                    background: sitting > 0 ? COLORS.goldSoft : COLORS.card,
+                    color: COLORS.ink,
+                    border: `1px solid ${COLORS.border}`,
+                  }}
+                >
+                  {a.name} {sitting.toLocaleString()}
+                </span>
+              </Fragment>
+              );
+            })}
+          </Fragment>
+        );
+      })}
+    </div>
   );
 }
 
-function AlertIcon() {
+function formContributionByVariant(employees, rowsState, orders = [], histTotals = {}) {
+  const map = {};
+  const orderMap = {};
+  (orders || []).forEach((o) => {
+    orderMap[o.order_id] = o;
+  });
+
+  (employees || []).forEach((emp) => {
+    const row = rowsState?.[emp.id];
+    if (!row || row.isLeave) return;
+    row.entries.forEach((entry) => {
+      if (!entry.variantId || entry.addonId) return;
+      const qty = Number(entry.qty) || 0;
+      if (qty <= 0) return;
+
+      // Packing a set: qty is complete sets — catch up every part (leaders may need 0)
+      if (emp.station === "Packing") {
+        const order = orderMap[Number(entry.orderId)];
+        const primary = (order?.lines || []).find((l) => l.order_line_id === Number(entry.orderLineId));
+        const gk = entry.setGroupKey || (primary ? setGroupKey(primary) : null);
+        if (gk && primary) {
+          const design = designNameFromVariant(primary, entry.variantId);
+          const groupLines = (order?.lines || []).filter((l) => setGroupKey(l) === gk);
+          const siblings = [];
+          for (const gl of groupLines) {
+            const mv = matchVariantByDesign(gl, design);
+            if (!mv) continue;
+            siblings.push({
+              line: gl,
+              variantId: mv.variant_id,
+              qtyPerSet: qtyPerSetOf(gl),
+              partName: partNameOf(gl),
+            });
+          }
+          if (siblings.length >= 2) {
+            const needs = setPackCatchUpNeeds(siblings, qty, histTotals);
+            for (const n of needs) {
+              if (n.need <= 0) continue;
+              if (!map[n.variantId]) map[n.variantId] = emptyStationTotals();
+              map[n.variantId].Packing = (Number(map[n.variantId].Packing) || 0) + n.need;
+            }
+            return;
+          }
+        }
+      }
+
+      if (!map[entry.variantId]) map[entry.variantId] = emptyStationTotals();
+      map[entry.variantId][emp.station] =
+        (Number(map[entry.variantId][emp.station]) || 0) + qty;
+    });
+  });
+  return map;
+}
+
+function formAddonContributionByVariant(employees, rowsState) {
+  const map = {};
+  (employees || []).forEach((emp) => {
+    const row = rowsState?.[emp.id];
+    if (!row || row.isLeave) return;
+    row.entries.forEach((entry) => {
+      if (!entry.variantId || !entry.addonId) return;
+      const qty = Number(entry.qty) || 0;
+      if (qty <= 0) return;
+      if (!map[entry.variantId]) map[entry.variantId] = {};
+      map[entry.variantId][entry.addonId] =
+        (Number(map[entry.variantId][entry.addonId]) || 0) + qty;
+    });
+  });
+  return map;
+}
+
+function FloorBoard({ orders, totalsForVariant, addonTotalsForVariant, onPick }) {
+  const cards = useMemo(() => {
+    return (orders || []).map((order) => {
+      const parts = (order.lines || []).flatMap((line) =>
+        (line.variants || []).map((v) => {
+          const totals = totalsForVariant(v.variant_id);
+          const addonTotals = addonTotalsForVariant?.(v.variant_id) || {};
+          return {
+            key: `${line.order_line_id}-${v.variant_id}`,
+            orderId: order.order_id,
+            orderLineId: line.order_line_id,
+            variantId: v.variant_id,
+            line,
+            variant: v,
+            totals,
+            status: describePipelineStatus(line, totals, addonTotals),
+          };
+        })
+      );
+      return { order, parts };
+    }).filter((c) => c.parts.length);
+  }, [orders, totalsForVariant, addonTotalsForVariant]);
+
+  if (!cards.length) {
+    return (
+      <div className="rounded-2xl p-8 text-center" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+        <p className="text-[13px]" style={{ color: COLORS.graphiteLight }}>No open ATM orders yet.</p>
+      </div>
+    );
+  }
+
   return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
-      <path d="M8 1.8l6.2 11.2H1.8L8 1.8z" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" />
-      <path d="M8 6v3.5M8 11.8v.01" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-    </svg>
+    <div className="flex flex-col gap-3">
+      {cards.map(({ order, parts }) => (
+        <div key={order.order_id} className="rounded-2xl overflow-hidden" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+          <div className="flex items-center justify-between gap-3 px-4 py-3" style={{ background: COLORS.boneDim, borderBottom: `1px solid ${COLORS.border}` }}>
+            <div>
+              <div className="text-[14px] font-semibold" style={{ color: COLORS.ink }}>
+                ATM {order.atm_no} · {order.customer}
+              </div>
+              <div className="text-[11px] mt-0.5" style={{ color: COLORS.graphiteLight }}>
+                {parts.length} part{parts.length === 1 ? "" : "s"} on the floor
+              </div>
+            </div>
+          </div>
+          <div className="divide-y" style={{ borderColor: COLORS.border }}>
+            {parts.map((p) => (
+              <button
+                key={p.key}
+                type="button"
+                className="w-full text-left px-4 py-3 hover:brightness-[0.99] transition"
+                style={{ background: COLORS.card }}
+                onClick={() => onPick?.(p)}
+              >
+                <div className="flex flex-wrap items-start justify-between gap-2 mb-2">
+                  <div className="min-w-0">
+                    <div className="text-[13px] font-semibold truncate" style={{ color: COLORS.ink }}>
+                      {p.line.article_name}
+                      {p.line.dimension_name ? ` · ${p.line.dimension_name}` : ""}
+                    </div>
+                    <div className="text-[11.5px] mt-0.5" style={{ color: COLORS.graphite }}>
+                      {p.variant.variant_name} · order {Number(p.variant.quantity || 0).toLocaleString()} pcs
+                    </div>
+                  </div>
+                  <div className="text-[11.5px] font-semibold text-right" style={{ color: COLORS.goldDim }}>
+                    {p.status}
+                  </div>
+                </div>
+                <StationPills line={p.line} totals={p.totals} orderQty={p.variant.quantity} />
+              </button>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function LockedBatch({ date, day }) {
+  const unitWord = (day.lines || []).some((ln) => ln.unit_label === "sets") ? "units" : "pcs";
+  return (
+    <div className="rounded-xl px-3 py-3 space-y-2" style={{ background: COLORS.bone, border: `1px solid ${COLORS.border}` }}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-[13px] font-semibold" style={{ color: COLORS.ink }}>
+          {formatKarachiDMY(date)}
+          {day.status === "leave" ? (
+            <span className="font-normal" style={{ color: COLORS.rust }}> · no work / leave</span>
+          ) : (
+            <span className="font-normal" style={{ color: COLORS.graphite }}>
+              {" "}· {Number(day.qty || 0).toLocaleString()} {unitWord}
+            </span>
+          )}
+        </div>
+        <span className="text-[10px] font-semibold uppercase tracking-wide" style={{ color: COLORS.graphiteLight }}>
+          This batch is locked
+        </span>
+      </div>
+      {day.status === "work" && (day.lines || []).map((ln) => (
+        <div key={ln.log_id} className="text-[11.5px]" style={{ color: COLORS.graphite }}>
+          {(ln.atm_no ? `ATM ${ln.atm_no}` : "ATM")}
+          {ln.article_name ? ` · ${ln.article_name}` : ""}
+          {ln.variant_name ? ` · ${ln.variant_name}` : ""}
+          {ln.addon_id ? " · add-on" : ln.station ? ` · ${ln.station}` : ""}
+          {" · "}
+          {Number(ln.quantity || 0).toLocaleString()} {ln.unit_label === "sets" ? "set" : "pcs"}
+          {ln.unit_label === "sets" && Number(ln.quantity) !== 1 ? "s" : ""}
+          {ln.defects ? ` · ${ln.defects} def` : ""}
+        </div>
+      ))}
+      <p className="text-[11px]" style={{ color: COLORS.graphiteLight }}>
+        Saved · locked (editing would break stock). You can still add more below.
+      </p>
+    </div>
   );
 }
 
 export default function DailyEntryPage() {
-  const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  const [workDate, setWorkDate] = useState(getFormattedDate(0));
+  const karachiToday = karachiTodayISO();
   const [search, setSearch] = useState("");
   const [stationFilter, setStationFilter] = useState("All stations");
-  const [statusFilter, setStatusFilter] = useState("All status");
-  const [bulkItemSelect, setBulkItemSelect] = useState("");
-  const [savedSuccess, setSavedSuccess] = useState(false);
-  const [saveError, setSaveError] = useState("");
-  const [csvModalOpen, setCsvModalOpen] = useState(false);
-  const [confirmModalOpen, setConfirmModalOpen] = useState(false);
-  const [csvText, setCsvText] = useState("");
+  const [activeEmpId, setActiveEmpId] = useState(null);
+  const [floorPick, setFloorPick] = useState(null);
 
-  const todayStr = getFormattedDate(0);
-  const isPastDate = workDate < todayStr;
-
-  // Live data from the backend — replaces the old hardcoded INITIAL_EMPLOYEES / ITEMS_LIST.
   const [employees, setEmployees] = useState([]);
-  const [articles, setArticles] = useState([]);
   const [orders, setOrders] = useState([]);
+  const [fullTotals, setFullTotals] = useState({});
+  const [fullAddonTotals, setFullAddonTotals] = useState({});
+  /** EMP-id → { dates: { ISO: { status, qty, lines } } } */
+  const [employeeDays, setEmployeeDays] = useState({});
 
-  useEffect(() => {
-    async function fetchData() {
-      try {
-        const [empRes, artRes, ordRes] = await Promise.all([
-          apiFetch("/api/employees"),
-          apiFetch("/api/articles"),
-          apiFetch("/api/orders"),
-        ]);
-        const empData = await empRes.json();
-        const artData = await artRes.json();
-        const ordData = await ordRes.json();
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [savedSuccess, setSavedSuccess] = useState(false);
+  const [rows, setRows] = useState({});
 
-        setEmployees(
-          empData.map((emp) => ({
-            id: `EMP-${emp.e_id}`,
-            numericId: emp.e_id,
-            name: emp.full_name,
-            station: emp.station,
-            image: emp.image_link,
-          }))
-        );
-
-        setArticles(
-          artData.map((a) => ({
-            id: a.article_id,
-            name: a.article_name,
-            rates: {
-              Cutting: Number(a.rate_cutting),
-              Stitching: Number(a.rate_stitching),
-              Checking: Number(a.rate_checking),
-              Packing: Number(a.rate_packing),
-            },
-            sizes: Array.isArray(a.sizes) ? a.sizes : [],
-            dimensions: Array.isArray(a.dimensions) ? a.dimensions : [],
-            variants: Array.isArray(a.variants) ? a.variants : [],
-          }))
-        );
-
-        setOrders(Array.isArray(ordData) ? ordData : []);
-      } catch (err) {
-        console.error("Failed to fetch employees/articles/orders", err);
+  const refreshFullTotals = useCallback(async () => {
+    try {
+      const res = await apiFetch("/api/production/station-totals");
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (data && data.stations && typeof data.stations === "object") {
+        setFullTotals(data.stations);
+        setFullAddonTotals(data.addons || {});
+      } else {
+        // legacy shape: flat variant → stations
+        const { stations: _s, addons: a, ...rest } = data || {};
+        setFullTotals(rest);
+        setFullAddonTotals(a || {});
       }
+      return data;
+    } catch (err) {
+      console.error(err);
+      return null;
     }
-    fetchData();
   }, []);
 
-  // Order lines still open (not yet fully packed) for the article/size/dimension
-  // an entry has selected — this is what populates the "For Order" dropdown.
-  function openOrderLinesFor(entry) {
-    const options = [];
-    orders.forEach((order) => {
-      (order.lines || []).forEach((line) => {
-        if (line.article_id !== entry.articleId) return;
-        if ((line.size_id || null) !== (entry.sizeId || null)) return;
-        if ((line.dimension_id || null) !== (entry.dimensionId || null)) return;
-        const readyQty = (line.variants || []).reduce((s, v) => s + (Number(v.ready_quantity) || 0), 0);
-        if (readyQty >= line.quantity) return; // already fully packed
-        options.push({
-          orderId: order.order_id,
-          label: `ATM ${order.atm_no} · ${order.customer} — ${line.quantity - readyQty} left`,
-        });
-      });
-    });
-    return options;
-  }
-
-  // Active grid rows — populated from the real batch fetch below, keyed by employee id.
-  const [rows, setRows] = useState({});
-  const [isLocked, setIsLocked] = useState(false);
-
-  const isDateLocked = isLocked;
-
-  function emptyEntry() {
-    return { articleId: articles[0]?.id ?? null, sizeId: null, dimensionId: null, variantId: null, allocation: "SIDE_STOCK", orderId: null, qty: 0, defects: 0 };
-  }
-
-  function emptyRow() { return { entries: [emptyEntry()], isLeave: false }; }
-  function rowEntries(row) { return row?.entries?.length ? row.entries : [emptyEntry()]; }
-
-  // Effective rate cascade: article base -> overridden by the chosen Size's
-  // non-null fields -> overridden by the chosen Dimension's non-null fields
-  // (Dimension wins on conflict, since dimension differences usually drive
-  // labor cost the most directly — e.g. multi-piece duvet sets).
-  function entryRate(entry, station) {
-    const article = articles.find((item) => item.id === entry.articleId) || articles[0];
-    const rateField = { Cutting: "rate_cutting", Stitching: "rate_stitching", Checking: "rate_checking", Packing: "rate_packing" }[station];
-    let rate = Number(article?.rates?.[station] ?? 0);
-
-    const size = article?.sizes?.find((s) => s.size_id === entry.sizeId);
-    if (size && size[rateField] !== null && size[rateField] !== undefined) rate = Number(size[rateField]);
-
-    const dimension = article?.dimensions?.find((d) => d.dimension_id === entry.dimensionId);
-    if (dimension && dimension[rateField] !== null && dimension[rateField] !== undefined) rate = Number(dimension[rateField]);
-
-    return rate;
-  }
-
-  // Load whichever date is selected: pulls the real saved batch if one exists
-  // (and locks the UI if it's already submitted), otherwise starts a blank sheet.
-  useEffect(() => {
-    async function fetchBatch() {
-      try {
-        const res = await apiFetch(`/api/production/batch/${workDate}`);
-        const data = await res.json();
-        setIsLocked(data.isLocked);
-
-        if (data.rows.length > 0) {
-          const loadedRows = {};
-          data.rows.forEach((r) => {
-            const empId = `EMP-${r.employee_id}`;
-            if (r.isLeave) {
-              loadedRows[empId] = { entries: [emptyEntry()], isLeave: true };
-              return;
-            }
-            const entry = {
-              articleId: r.article_id,
-              sizeId: r.size_id || null,
-              dimensionId: r.dimension_id || null,
-              variantId: r.variant_id || null,
-              allocation: r.allocation || "SIDE_STOCK",
-              orderId: r.order_id || null,
-              qty: r.quantity,
-              defects: r.defects || 0,
-            };
-            if (loadedRows[empId]) {
-              loadedRows[empId] = { ...loadedRows[empId], entries: [...loadedRows[empId].entries, entry] };
-            } else {
-              loadedRows[empId] = { entries: [entry], isLeave: false };
-            }
-          });
-          // Any employee with no saved rows for this date still gets a blank sheet row.
-          employees.forEach((emp) => {
-            if (!loadedRows[emp.id]) loadedRows[emp.id] = emptyRow();
-          });
-          setRows(loadedRows);
-        } else {
-          const initial = {};
-          employees.forEach((emp) => {
-            initial[emp.id] = emptyRow();
-          });
-          setRows(initial);
-        }
-      } catch (err) {
-        console.error("Failed to fetch batch", err);
+  const loadEmployeeDays = useCallback(async (emps, { keepDrafts = false } = {}) => {
+    const today = karachiTodayISO();
+    let from = addDaysISO(today, -(LOOKBACK_DAYS - 1));
+    for (const emp of emps) {
+      if (emp.joiningDate && emp.joiningDate > from && emp.joiningDate <= today) {
+        // keep from as lookback; joining only clamps min date on picker
+      }
+      if (emp.joiningDate && emp.joiningDate < from) {
+        /* lookback wins for API range */
       }
     }
-    if (employees.length > 0 && articles.length > 0) fetchBatch();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workDate, employees, articles]);
+    const res = await apiFetch(`/api/production/employee-days?from=${from}&to=${today}`);
+    if (!res.ok) throw new Error(await readApiError(res, "Failed to load employee days"));
+    const data = await res.json();
 
-  function updateEntry(empId, entryIndex, field, value) {
-    if (isDateLocked) return;
-    setRows((prev) => {
-      const row = prev[empId] || emptyRow();
-      const entries = rowEntries(row).map((entry, index) => index === entryIndex ? { ...entry, [field]: value } : entry);
-      return { ...prev, [empId]: { ...row, entries } };
+    const map = {};
+    emps.forEach((emp) => {
+      map[emp.id] = { dates: {} };
     });
-  }
-
-  // Changing the article on an entry always resets the chosen variant —
-  // dimension/design/color options are specific to each article.
-  function updateEntryArticle(empId, entryIndex, articleId) {
-    if (isDateLocked) return;
-    setRows((prev) => {
-      const row = prev[empId] || emptyRow();
-      const entries = rowEntries(row).map((entry, index) =>
-        index === entryIndex ? { ...entry, articleId, sizeId: null, dimensionId: null, variantId: null } : entry
-      );
-      return { ...prev, [empId]: { ...row, entries } };
+    (Array.isArray(data) ? data : []).forEach((row) => {
+      const id = `EMP-${row.employee_id}`;
+      map[id] = { dates: row.dates || {} };
     });
-  }
+    setEmployeeDays(map);
 
-  function variantLabel(variant) {
-    if (!variant) return "";
-    return variant.variant_name || `Variant #${variant.variant_id}`;
-  }
+    if (!keepDrafts) {
+      setRows((prev) => {
+        const next = {};
+        emps.forEach((emp) => {
+          const prevDate = prev[emp.id]?.targetDate;
+          const date =
+            prevDate && prevDate <= today && (!emp.joiningDate || prevDate >= emp.joiningDate)
+              ? prevDate
+              : today;
+          next[emp.id] = emptyDraft(date);
+        });
+        return next;
+      });
+    }
+    return map;
+  }, []);
 
-  function addEntry(empId) {
-    if (isDateLocked) return;
-    setRows((prev) => {
-      const row = prev[empId] || emptyRow();
-      return { ...prev, [empId]: { ...row, entries: [...rowEntries(row), emptyEntry()] } };
+  useEffect(() => {
+    let cancelled = false;
+    async function loadBase() {
+      setLoading(true);
+      setLoadError("");
+      try {
+        const [empRes, ordRes] = await Promise.all([
+          apiFetch("/api/employees"),
+          apiFetch("/api/orders"),
+        ]);
+        if (!empRes.ok) throw new Error(await readApiError(empRes, "Failed to load employees"));
+        if (!ordRes.ok) throw new Error(await readApiError(ordRes, "Failed to load orders"));
+        const [empData, ordData] = await Promise.all([empRes.json(), ordRes.json()]);
+        if (cancelled) return;
+        const today = karachiTodayISO();
+        const emps = (Array.isArray(empData) ? empData : [])
+          .filter((e) => String(e.station || "").trim().toLowerCase() !== "management")
+          .map((e) => ({
+          id: `EMP-${e.e_id}`,
+          numericId: e.e_id,
+          name: e.full_name,
+          station: e.station || "Stitching",
+          image: e.image_link,
+          joiningDate: toIsoDateOnly(e.joining_date) || null,
+        }));
+        setEmployees(emps);
+        // Shipped orders are closed — no further daily production on them
+        setOrders(
+          (Array.isArray(ordData) ? ordData : []).filter((o) => o.payment_status !== "shipped")
+        );
+        const blank = {};
+        emps.forEach((emp) => {
+          blank[emp.id] = emptyDraft(today);
+        });
+        setRows(blank);
+        await Promise.all([refreshFullTotals(), loadEmployeeDays(emps)]);
+      } catch (err) {
+        console.error(err);
+        if (!cancelled) setLoadError(err.message || "Could not load data");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+    loadBase();
+    return () => { cancelled = true; };
+  }, [refreshFullTotals, loadEmployeeDays]);
+
+  const orderById = (id) => orders.find((o) => o.order_id === Number(id)) || null;
+
+  const formByVariant = useMemo(
+    () => formContributionByVariant(employees, rows, orders, fullTotals),
+    [employees, rows, orders, fullTotals]
+  );
+  const formAddonByVariant = useMemo(
+    () => formAddonContributionByVariant(employees, rows),
+    [employees, rows]
+  );
+
+  const totalsForVariant = useCallback(
+    (variantId) => liveStationTotals(fullTotals[variantId], formByVariant[variantId]),
+    [fullTotals, formByVariant]
+  );
+  const addonTotalsForVariant = useCallback(
+    (variantId) => liveAddonTotals(fullAddonTotals[variantId], formAddonByVariant[variantId]),
+    [fullAddonTotals, formAddonByVariant]
+  );
+
+  /** Live station totals map for all variants (history + today's form). */
+  const allLiveTotalsByVariant = useMemo(() => {
+    const map = { ...fullTotals };
+    Object.keys(formByVariant || {}).forEach((vid) => {
+      map[vid] = liveStationTotals(fullTotals[vid], formByVariant[vid]);
     });
-  }
-
-  function removeEntry(empId, entryIndex) {
-    if (isDateLocked) return;
-    setRows((prev) => {
-      const row = prev[empId] || emptyRow();
-      const entries = rowEntries(row).filter((_, index) => index !== entryIndex);
-      return { ...prev, [empId]: { ...row, entries: entries.length ? entries : [emptyEntry()] } };
+    // Ensure every known hist key is live-merged
+    Object.keys(fullTotals || {}).forEach((vid) => {
+      if (!map[vid] || formByVariant[vid]) {
+        map[vid] = liveStationTotals(fullTotals[vid], formByVariant[vid]);
+      }
     });
+    return map;
+  }, [fullTotals, formByVariant]);
+
+  function setPackContextFor(order, line, variantId, totalsMap) {
+    if (!order || !line || !variantId) return null;
+    return buildSetPackContext(order.lines || [], line, variantId, totalsMap || allLiveTotalsByVariant);
   }
 
-  function toggleLeave(empId) {
-    if (isDateLocked) return;
+  useEffect(() => {
     setRows((prev) => {
-      const current = prev[empId] || emptyRow();
-      const nextLeave = !current.isLeave;
+      const currentForm = formContributionByVariant(employees, prev, orders, fullTotals);
+      const currentAddonForm = formAddonContributionByVariant(employees, prev);
+      let changed = false;
+      const next = { ...prev };
+      for (const emp of employees) {
+        const row = next[emp.id];
+        if (!row || row.isLeave) continue;
+        let rowChanged = false;
+        const entries = row.entries.map((entry) => {
+          if (!entry.variantId || !entry.orderId || !entry.orderLineId) return entry;
+          const order = orders.find((o) => o.order_id === Number(entry.orderId));
+          const line = order?.lines?.find((l) => l.order_line_id === Number(entry.orderLineId));
+          if (!line) return entry;
+
+          if (entry.addonId) {
+            const addon = findLineAddon(line, entry.addonId);
+            if (!addon || addonWorkStation(addon) !== emp.station) {
+              if (!entry.addonId && (entry.qty === "" || entry.qty == null)) return entry;
+              rowChanged = true;
+              return { ...entry, addonId: null, qty: "" };
+            }
+            const formWithout = { ...(currentAddonForm[entry.variantId] || {}) };
+            const q = Number(entry.qty) || 0;
+            formWithout[entry.addonId] = Math.max(0, (Number(formWithout[entry.addonId]) || 0) - q);
+            const liveAddons = liveAddonTotals(fullAddonTotals[entry.variantId], formWithout);
+            const stationLive = liveStationTotals(fullTotals[entry.variantId], currentForm[entry.variantId]);
+            const headroom = availableForAddon(
+              line,
+              addon,
+              stationLive,
+              Number(liveAddons[entry.addonId]) || 0
+            );
+            const capped = clampQtyToHeadroom(entry.qty, headroom);
+            if (capped !== String(entry.qty ?? "")) {
+              rowChanged = true;
+              return { ...entry, qty: capped };
+            }
+            return entry;
+          }
+
+          if (skipMap(line)[emp.station]) {
+            if (entry.qty === "" || entry.qty == null) return entry;
+            rowChanged = true;
+            return { ...entry, qty: "" };
+          }
+
+          // Packing a set: qty is complete sets (catch-up all parts)
+          if (emp.station === "Packing") {
+            const gk = entry.setGroupKey || setGroupKey(line);
+            if (gk) {
+              const groupLines = (order.lines || []).filter((l) => setGroupKey(l) === gk);
+              if (groupLines.length >= 2) {
+                // Headroom vs hist only (exclude this draft — catch-up uses hist base)
+                const ctx = buildSetPackContext(order.lines || [], line, entry.variantId, fullTotals);
+                const packPrev = previousStation(line, "Packing");
+                const headroom = availableSetPackSets(ctx, packPrev);
+                const capped = clampQtyToHeadroom(entry.qty, headroom);
+                if (capped !== String(entry.qty ?? "") || !entry.setGroupKey) {
+                  rowChanged = true;
+                  return { ...entry, qty: capped, setGroupKey: gk };
+                }
+                return entry;
+              }
+            }
+          }
+
+          const formWithoutThis = { ...emptyStationTotals(), ...(currentForm[entry.variantId] || {}) };
+          const q = Number(entry.qty) || 0;
+          formWithoutThis[emp.station] = Math.max(0, (Number(formWithoutThis[emp.station]) || 0) - q);
+          const liveWithout = liveStationTotals(fullTotals[entry.variantId], formWithoutThis);
+          const totalsMap = {};
+          Object.keys(fullTotals || {}).forEach((vid) => {
+            totalsMap[vid] = liveStationTotals(fullTotals[vid], currentForm[vid]);
+          });
+          Object.keys(currentForm || {}).forEach((vid) => {
+            totalsMap[vid] = liveStationTotals(fullTotals[vid], currentForm[vid]);
+          });
+          totalsMap[entry.variantId] = liveWithout;
+          const setPackCtx =
+            emp.station === "Packing"
+              ? buildSetPackContext(order.lines || [], line, entry.variantId, totalsMap)
+              : null;
+          const headroom = availableForStation(
+            line,
+            emp.station,
+            liveWithout,
+            liveAddonTotals(fullAddonTotals[entry.variantId], currentAddonForm[entry.variantId]),
+            setPackCtx
+          );
+          if (headroom == null) return entry;
+          const capped = clampQtyToHeadroom(entry.qty, headroom);
+          if (capped !== String(entry.qty ?? "")) {
+            rowChanged = true;
+            return { ...entry, qty: capped };
+          }
+          return entry;
+        });
+        if (rowChanged) {
+          changed = true;
+          next[emp.id] = { ...row, entries };
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [employees, orders, fullTotals, fullAddonTotals]);
+
+  const filteredEmployees = useMemo(() => {
+    return employees.filter((emp) => {
+      if (stationFilter !== "All stations" && emp.station !== stationFilter) return false;
+      const q = search.toLowerCase();
+      if (!q) return true;
+      return emp.name.toLowerCase().includes(q) || emp.station.toLowerCase().includes(q) || String(emp.numericId).includes(q);
+    });
+  }, [employees, search, stationFilter]);
+
+  const stats = useMemo(() => {
+    let entriesCount = 0;
+    let totalQty = 0;
+    let totalPayout = 0;
+    let onLeave = 0;
+    employees.forEach((emp) => {
+      const row = rows[emp.id];
+      const dayToday = employeeDays[emp.id]?.dates?.[karachiToday];
+      if (dayToday?.status === "leave" || row?.isLeave) onLeave += 1;
+      if (!row || row.isLeave) return;
+      row.entries.forEach((entry) => {
+        const qty = Number(entry.qty) || 0;
+        if (!entry.orderId || qty <= 0) return;
+        entriesCount += 1;
+        totalQty += qty;
+        const order = orderById(entry.orderId);
+        const line = order?.lines?.find((l) => l.order_line_id === Number(entry.orderLineId));
+        if (emp.station === "Packing" && entry.setGroupKey) {
+          const groupLines = (order?.lines || []).filter((l) => setGroupKey(l) === entry.setGroupKey);
+          totalPayout += Math.round(qty * setPackRatePerSet(groupLines));
+        } else {
+          totalPayout += Math.round(qty * entryRate(line, emp.station, entry.addonId));
+        }
+      });
+    });
+    return { entriesCount, totalQty, totalPayout, onLeave, atmCount: orders.length };
+  }, [employees, rows, orders, employeeDays, karachiToday]);
+
+  function patchRow(empId, patch) {
+    setRows((prev) => ({ ...prev, [empId]: { ...prev[empId], ...patch } }));
+  }
+
+  function setEmpDate(empId, iso) {
+    const emp = employees.find((e) => e.id === empId);
+    let date = iso || karachiToday;
+    if (date > karachiToday) date = karachiToday;
+    if (emp?.joiningDate && date < emp.joiningDate) date = emp.joiningDate;
+    setRows((prev) => ({
+      ...prev,
+      [empId]: emptyDraft(date),
+    }));
+  }
+
+  function patchEntry(empId, index, patch) {
+    setRows((prev) => {
+      const row = prev[empId] || emptyDraft(karachiToday);
       return {
         ...prev,
         [empId]: {
-          ...current,
-          isLeave: nextLeave,
-          qty: nextLeave ? 0 : (current.qty || 100),
+          ...row,
+          entries: row.entries.map((e, i) => (i === index ? { ...e, ...patch } : e)),
         },
       };
     });
   }
 
-  function handleApplyBulkArticle(articleId) {
-    if (isDateLocked || !articleId) return;
+  function addEntry(empId, preset = null) {
     setRows((prev) => {
-      const next = { ...prev };
-      Object.keys(next).forEach((id) => {
-        const row = next[id] || emptyRow();
-        const entries = rowEntries(row);
-        const updated = [{ ...entries[0], articleId, sizeId: null, dimensionId: null, variantId: null }, ...entries.slice(1)];
-        next[id] = { ...row, entries: updated };
-      });
-      return next;
+      const row = prev[empId] || emptyDraft(karachiToday);
+      const nextEntry = preset
+        ? {
+            ...emptyEntry(),
+            orderId: preset.orderId,
+            orderLineId: preset.orderLineId,
+            variantId: preset.variantId,
+            addonId: preset.addonId || null,
+            packItemKey: preset.packItemKey || null,
+            setGroupKey: preset.setGroupKey || null,
+          }
+        : emptyEntry();
+      const entries = row.entries;
+      const onlyEmpty =
+        entries.length === 1 &&
+        !entries[0].orderId &&
+        !entries[0].qty;
+      return {
+        ...prev,
+        [empId]: {
+          ...row,
+          isLeave: false,
+          addingMore: true,
+          entries: onlyEmpty ? [nextEntry] : [...entries, nextEntry],
+        },
+      };
     });
-    setBulkItemSelect("");
   }
 
-  function handleResetAllQuantities() {
-    if (isDateLocked) return;
+  function removeEntry(empId, index) {
     setRows((prev) => {
-      const next = { ...prev };
-      Object.keys(next).forEach((id) => {
-        const row = next[id] || emptyRow();
-        const entries = rowEntries(row).map((entry) => ({ ...entry, qty: 0, defects: 0 }));
-        next[id] = { ...row, entries };
-      });
-      return next;
+      const row = prev[empId];
+      if (!row) return prev;
+      const entries = row.entries.filter((_, i) => i !== index);
+      return { ...prev, [empId]: { ...row, entries: entries.length ? entries : [emptyEntry()] } };
     });
   }
 
-  const filteredEmployees = useMemo(() => {
-    return employees.filter((emp) => {
-      const rowState = rows[emp.id] || { isLeave: false };
-      const matchesStation = stationFilter === "All stations" || emp.station === stationFilter;
-      const matchesStatus =
-        statusFilter === "All status"
-          ? true
-          : statusFilter === "Present"
-          ? !rowState.isLeave
-          : rowState.isLeave;
-
-      const matchesSearch =
-        emp.name.toLowerCase().includes(search.toLowerCase()) ||
-        emp.id.toLowerCase().includes(search.toLowerCase()) ||
-        emp.station.toLowerCase().includes(search.toLowerCase());
-
-      return matchesStation && matchesStatus && matchesSearch;
-    });
-  }, [employees, rows, search, stationFilter, statusFilter]);
-
-  const summary = useMemo(() => {
-    let totalUnits = 0;
-    let totalPayout = 0;
-    let presentCount = 0;
-    let leaveCount = 0;
-
-    employees.forEach((emp) => {
-      const row = rows[emp.id] || emptyRow();
-      if (row.isLeave) {
-        leaveCount++;
-      } else {
-        presentCount++;
-        rowEntries(row).forEach((entry) => {
-          const qtyNum = Number(entry.qty) || 0;
-          totalUnits += qtyNum;
-          totalPayout += Math.round(qtyNum * entryRate(entry, emp.station));
-        });
-      }
-    });
-
-    return { totalUnits, totalPayout, presentCount, leaveCount };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [employees, articles, rows]);
-
-  function handleRequestSave() {
-    if (isDateLocked) return;
-    setConfirmModalOpen(true);
-  }
-
-  async function handleConfirmAndLockSave() {
-    const rowsPayload = employees.flatMap((emp) => {
-      const row = rows[emp.id] || emptyRow();
-      if (row.isLeave) return [{ employee_id: emp.numericId, station: emp.station, isLeave: true }];
-      return rowEntries(row).map((entry) => ({
-        employee_id: emp.numericId,
-        article_id: entry.articleId,
-        size_id: entry.sizeId || null,
-        dimension_id: entry.dimensionId || null,
-        variant_id: entry.variantId || null,
-        allocation: entry.allocation || "SIDE_STOCK",
-        order_id: entry.allocation === "FOR_ORDER" ? entry.orderId || null : null,
-        station: emp.station,
-        quantity: Number(entry.qty) || 0,
-        defects: Number(entry.defects) || 0,
-        rate: entryRate(entry, emp.station),
-        isLeave: false,
-      }));
-    });
-
-    try {
-      setSaveError("");
-      const res = await apiFetch("/api/production/batch", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ work_date: workDate, rows: rowsPayload }),
-      });
-
-      const data = await res.json();
-
-      if (!res.ok) {
-        setSaveError(data.error || "The batch could not be saved. Please try again.");
-        setConfirmModalOpen(false);
-        return;
-      }
-
-      setIsLocked(true);
-      setConfirmModalOpen(false);
-      setSavedSuccess(true);
-      setTimeout(() => {
-        setSavedSuccess(false);
-      }, 4000);
-    } catch (err) {
-      console.error(err);
-      setSaveError("Could not reach the server. Please try again.");
-      setConfirmModalOpen(false);
-    }
-  }
-
-  function handleImportCsv() {
-    if (isDateLocked || !csvText.trim()) return;
-    const lines = csvText.split("\n");
-    const next = { ...rows };
-
-    lines.forEach((line) => {
-      const parts = line.split(",").map((s) => s.trim());
-      if (parts.length >= 2) {
-        const idOrName = parts[0];
-        const isLeaveStr = parts[1].toLowerCase() === "leave" || parts[1].toLowerCase() === "absent";
-        const qty = isLeaveStr ? 0 : (Number(parts[1]) || 0);
-        const articleName = parts[2] || articles[0]?.name || "";
-
-        const matchEmp = employees.find(
-          (e) => e.id.toLowerCase() === idOrName.toLowerCase() || e.name.toLowerCase().includes(idOrName.toLowerCase())
-        );
-        const matchArticle =
-          articles.find((a) => a.name.toLowerCase() === articleName.toLowerCase()) || articles[0];
-
-        if (matchEmp && matchArticle) {
-          const existingEntry = rowEntries(next[matchEmp.id])[0] || emptyEntry();
-          next[matchEmp.id] = {
-            entries: [{ ...existingEntry, articleId: matchArticle.id, sizeId: null, dimensionId: null, variantId: null, qty }],
-            isLeave: isLeaveStr,
+  function handleFloorPick(part) {
+    setFloorPick(part);
+    if (!activeEmpId) return;
+    const emp = employees.find((e) => e.id === activeEmpId);
+    const order = orders.find((o) => o.order_id === Number(part.orderId));
+    let preset = {
+      orderId: part.orderId,
+      orderLineId: part.orderLineId,
+      variantId: part.variantId,
+    };
+    // Packing: floor-pick a set part → select the whole set
+    if (emp?.station === "Packing" && order) {
+      const line = (order.lines || []).find((l) => l.order_line_id === Number(part.orderLineId));
+      const gk = line ? setGroupKey(line) : null;
+      if (gk) {
+        const items = buildPackItems(order);
+        const item = items.find((i) => i.type === "set" && i.groupKey === gk);
+        if (item) {
+          const design = designNameFromVariant(line, part.variantId);
+          const primaryVar = matchVariantByDesign(item.primaryLine, design);
+          preset = {
+            orderId: part.orderId,
+            orderLineId: item.primaryLine.order_line_id,
+            variantId: primaryVar?.variant_id || null,
+            packItemKey: item.key,
+            setGroupKey: gk,
           };
         }
       }
-    });
+    }
+    const row = rows[activeEmpId];
+    const day = employeeDays[activeEmpId]?.dates?.[row?.targetDate || karachiToday];
+    const locked = Boolean(day);
+    if (locked && !row?.addingMore) {
+      addEntry(activeEmpId, preset);
+      return;
+    }
+    addEntry(activeEmpId, preset);
+  }
 
-    setRows(next);
-    setCsvModalOpen(false);
-    setCsvText("");
+  function openEmployee(empId) {
+    setActiveEmpId(empId);
+    setRows((prev) => {
+      const row = prev[empId] || emptyDraft(karachiToday);
+      return { ...prev, [empId]: { ...row, targetDate: row.targetDate || karachiToday } };
+    });
+    if (floorPick) {
+      addEntry(empId, {
+        orderId: floorPick.orderId,
+        orderLineId: floorPick.orderLineId,
+        variantId: floorPick.variantId,
+      });
+    }
+  }
+
+  async function handleSave() {
+    setSaving(true);
+    setSaveError("");
+    setSavedSuccess(false);
+    try {
+      const byDateAppend = {};
+      const leaveByDate = {};
+
+      for (const emp of employees) {
+        const row = rows[emp.id];
+        if (!row) continue;
+        const date = toIsoDateOnly(row.targetDate) || karachiToday;
+        const already = employeeDays[emp.id]?.dates?.[date]?.status;
+
+        if (row.isLeave) {
+          if (already === "leave") continue;
+          if (already === "work") {
+            setSaveError(`${emp.name}: ${formatKarachiDMY(date)} already has saved work (locked)`);
+            setSaving(false);
+            return;
+          }
+          if (!leaveByDate[date]) leaveByDate[date] = [];
+          leaveByDate[date].push(emp.numericId);
+          continue;
+        }
+
+        // Only save drafts when day is empty OR user opened “Add more”
+        if (already && !row.addingMore) continue;
+
+        for (const entry of row.entries) {
+          const qty = Number(entry.qty) || 0;
+          const defects = Number(entry.defects) || 0;
+          if (qty <= 0 && defects <= 0) continue;
+          if (!entry.orderId || !entry.orderLineId || !entry.variantId) {
+            setSaveError(`${emp.name}: select ATM, item, and variant for every qty entry`);
+            setSaving(false);
+            return;
+          }
+          const order = orderById(entry.orderId);
+          const line = order?.lines?.find((l) => l.order_line_id === Number(entry.orderLineId));
+          if (line && !entry.addonId && skipMap(line)[emp.station]) {
+            setSaveError(`${emp.name}: ${emp.station} is skipped on that order part`);
+            setSaving(false);
+            return;
+          }
+          if (entry.addonId && line) {
+            const addon = findLineAddon(line, entry.addonId);
+            if (!addon) {
+              setSaveError(`${emp.name}: that add-on is not on the selected order part`);
+              setSaving(false);
+              return;
+            }
+            if (addonWorkStation(addon) !== emp.station) {
+              setSaveError(
+                `${emp.name}: ${addon.name} is logged by ${addonWorkStation(addon)}, not ${emp.station}`
+              );
+              setSaving(false);
+              return;
+            }
+          }
+          if (!byDateAppend[date]) byDateAppend[date] = [];
+
+          // Packing a set: one UI qty (sets) → catch-up packing on every part
+          if (emp.station === "Packing") {
+            const gk = entry.setGroupKey || (line ? setGroupKey(line) : null);
+            if (gk) {
+              const design = designNameFromVariant(line, entry.variantId);
+              const groupLines = (order?.lines || []).filter((l) => setGroupKey(l) === gk);
+              if (groupLines.length < 2) {
+                setSaveError(`${emp.name}: set packing needs at least 2 parts`);
+                setSaving(false);
+                return;
+              }
+              const siblings = [];
+              for (const gl of groupLines) {
+                const mv = matchVariantByDesign(gl, design);
+                if (!mv) {
+                  setSaveError(`${emp.name}: missing design "${design}" on ${partNameOf(gl)}`);
+                  setSaving(false);
+                  return;
+                }
+                siblings.push({
+                  line: gl,
+                  variantId: mv.variant_id,
+                  qtyPerSet: qtyPerSetOf(gl),
+                  partName: partNameOf(gl),
+                });
+              }
+              const needs = setPackCatchUpNeeds(siblings, qty, fullTotals);
+              for (const n of needs) {
+                if (n.need <= 0) continue;
+                byDateAppend[date].push({
+                  employee_id: emp.numericId,
+                  is_leave: false,
+                  order_id: Number(entry.orderId),
+                  order_line_id: n.line.order_line_id,
+                  variant_id: n.variantId,
+                  quantity: n.need,
+                  defects: defects > 0 ? defects : 0,
+                  addon_id: null,
+                });
+              }
+              // If everything already caught up, still count as handled (no orphan primary row)
+              continue;
+            }
+          }
+
+          byDateAppend[date].push({
+            employee_id: emp.numericId,
+            is_leave: false,
+            order_id: Number(entry.orderId),
+            order_line_id: Number(entry.orderLineId),
+            variant_id: entry.variantId,
+            quantity: qty,
+            defects,
+            addon_id: entry.addonId || null,
+          });
+        }
+      }
+
+      const hasAppend = Object.values(byDateAppend).some((e) => e.length);
+      const hasLeave = Object.values(leaveByDate).some((e) => e.length);
+      if (!hasAppend && !hasLeave) {
+        setSaveError("Nothing new to save — pick a date with no data, or Add more on a locked day");
+        setSaving(false);
+        return;
+      }
+
+      for (const emp of employees) {
+        const row = rows[emp.id];
+        if (!row || row.isLeave) continue;
+        for (const entry of row.entries) {
+          const qty = Number(entry.qty) || 0;
+          if (!entry.variantId || qty <= 0) continue;
+          const order = orderById(entry.orderId);
+          const line = order?.lines?.find((l) => l.order_line_id === Number(entry.orderLineId));
+          if (!line) continue;
+          const live = liveStationTotals(fullTotals[entry.variantId], formByVariant[entry.variantId]);
+          const liveAddons = liveAddonTotals(fullAddonTotals[entry.variantId], formAddonByVariant[entry.variantId]);
+
+          if (entry.addonId) {
+            const addon = findLineAddon(line, entry.addonId);
+            if (!addon) continue;
+            const done = Number(liveAddons[entry.addonId]) || 0;
+            const requires = addon.requiresStations || ["Cutting", "Stitching"];
+            let maxUp = Infinity;
+            for (const s of requires) {
+              if (skipMap(line)[s]) continue;
+              maxUp = Math.min(maxUp, Number(live[s]) || 0);
+            }
+            if (Number.isFinite(maxUp) && done > maxUp) {
+              setSaveError(
+                `${addon.name} (${done.toLocaleString()}) cannot exceed finished prerequisites (${maxUp.toLocaleString()}).`
+              );
+              setSaving(false);
+              return;
+            }
+            continue;
+          }
+
+          // Set packing: qty is complete sets — headroom vs hist (catch-up)
+          if (emp.station === "Packing") {
+            const gk = entry.setGroupKey || setGroupKey(line);
+            if (gk) {
+              const ctx = setPackContextFor(order, line, entry.variantId, fullTotals);
+              const packPrev = previousStation(line, "Packing");
+              const avail = availableSetPackSets(ctx, packPrev);
+              if (avail != null && qty > avail) {
+                const info = completeSetsReadyForPack(ctx, packPrev);
+                const short = (info?.bottlenecks || [])
+                  .filter((b) => b.partSets <= (info?.sets ?? 0))
+                  .map((b) => `${b.partName} (${b.upstream} ready / ${b.qtyPerSet} per set)`)
+                  .slice(0, 2)
+                  .join(", ");
+                setSaveError(
+                  `Only ${avail} complete set(s) can be packed` +
+                    (short ? ` — limited by ${short}` : "") +
+                    `. Check all parts first.`
+                );
+                setSaving(false);
+                return;
+              }
+              continue;
+            }
+          }
+
+          const prev = previousStation(line, emp.station);
+          if (prev) {
+            const upstream = Number(live[prev]) || 0;
+            const here = Number(live[emp.station]) || 0;
+            if (here > upstream) {
+              setSaveError(
+                `${emp.station} (${here.toLocaleString()}) cannot exceed ${prev} (${upstream.toLocaleString()}). More upstream first — over-order is OK.`
+              );
+              setSaving(false);
+              return;
+            }
+          }
+          if (emp.station === "Packing") {
+            const ctx = setPackContextFor(order, line, entry.variantId, allLiveTotalsByVariant);
+            if (ctx) {
+              const packPrev = previousStation(line, "Packing");
+              const info = completeSetsReadyForPack(ctx, packPrev);
+              if (info) {
+                const packed = Number(live.Packing) || 0;
+                const maxPieces = info.sets * qtyPerSetOf(line);
+                if (packed > maxPieces) {
+                  const short = (info.bottlenecks || [])
+                    .filter((b) => b.partSets <= info.sets)
+                    .map((b) => `${b.partName} (${b.upstream} ready / ${b.qtyPerSet} per set)`)
+                    .slice(0, 2)
+                    .join(", ");
+                  setSaveError(
+                    `Packing needs complete sets — only ${info.sets} set(s) ready` +
+                      (short ? ` (limited by ${short})` : "") +
+                      `. Pack matching parts together.`
+                  );
+                  setSaving(false);
+                  return;
+                }
+              }
+            }
+          }
+          const hereQty = Number(live[emp.station]) || 0;
+          for (const ad of lineSelectedAddons(line)) {
+            if ((ad.afterStation || "Checking") !== emp.station) continue;
+            const addonDone = Number(liveAddons[ad.id]) || 0;
+            if (hereQty > addonDone) {
+              setSaveError(
+                `${emp.station} (${hereQty.toLocaleString()}) needs more ${ad.name} first (${addonDone.toLocaleString()} done).`
+              );
+              setSaving(false);
+              return;
+            }
+          }
+        }
+      }
+
+      for (const [work_date, ids] of Object.entries(leaveByDate)) {
+        const res = await apiFetch("/api/production", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            work_date,
+            replace_all: false,
+            replace_employee_ids: ids,
+            entries: ids.map((id) => ({ employee_id: id, is_leave: true })),
+          }),
+        });
+        if (!res.ok) {
+          setSaveError(await readApiError(res, "Failed to save leave"));
+          return;
+        }
+      }
+
+      for (const [work_date, entries] of Object.entries(byDateAppend)) {
+        if (!entries.length) continue;
+        const res = await apiFetch("/api/production", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            work_date,
+            append: true,
+            replace_all: false,
+            entries,
+          }),
+        });
+        if (!res.ok) {
+          setSaveError(await readApiError(res, "Failed to save production"));
+          return;
+        }
+      }
+
+      const [ordRes] = await Promise.all([
+        apiFetch("/api/orders"),
+        refreshFullTotals(),
+      ]);
+      if (ordRes.ok) {
+        const ordData = await ordRes.json();
+        setOrders(
+          (Array.isArray(ordData) ? ordData : []).filter((o) => o.payment_status !== "shipped")
+        );
+      }
+      await loadEmployeeDays(employees, { keepDrafts: false });
+      setSavedSuccess(true);
+    } catch (err) {
+      console.error(err);
+      setSaveError("Could not reach the server");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function renderEntryForm(emp, row) {
+    return (
+      <div className="space-y-3">
+        {row.entries.map((entry, ei) => {
+          const order = orderById(entry.orderId);
+          const lines = order?.lines || [];
+          const line = lines.find((l) => l.order_line_id === Number(entry.orderLineId));
+          const packItem = emp.station === "Packing" ? packItemFromEntry(order, entry) : null;
+          const isSetPack = Boolean(packItem?.type === "set" || entry.setGroupKey);
+          const packItems = emp.station === "Packing" && order ? buildPackItems(order) : [];
+          const setGroupLines = isSetPack && order
+            ? (order.lines || []).filter((l) => setGroupKey(l) === (entry.setGroupKey || packItem?.groupKey))
+            : [];
+          const stationAddons = isSetPack ? [] : addonsForStation(line, emp.station);
+          const selectedAddon = entry.addonId ? findLineAddon(line, entry.addonId) : null;
+          const isAddonWork = Boolean(selectedAddon && addonWorkStation(selectedAddon) === emp.station);
+          const rate = isSetPack
+            ? setPackRatePerSet(setGroupLines)
+            : entryRate(line, emp.station, isAddonWork ? entry.addonId : null);
+          const qty = Number(entry.qty) || 0;
+          const skips = skipMap(line);
+          const stationSkipped = Boolean(line && !isAddonWork && !isSetPack && skips[emp.station]);
+          const live = entry.variantId ? totalsForVariant(entry.variantId) : emptyStationTotals();
+          const liveAddons = entry.variantId ? addonTotalsForVariant(entry.variantId) : {};
+
+          let headroom = null;
+          let isFirstStation = false;
+          if (line && entry.variantId && isAddonWork) {
+            const formWithout = { ...(formAddonByVariant[entry.variantId] || {}) };
+            if (qty > 0) {
+              formWithout[entry.addonId] = Math.max(0, (Number(formWithout[entry.addonId]) || 0) - qty);
+            }
+            const addonsExcluding = liveAddonTotals(fullAddonTotals[entry.variantId], formWithout);
+            headroom = availableForAddon(
+              line,
+              selectedAddon,
+              live,
+              Number(addonsExcluding[entry.addonId]) || 0
+            );
+          } else if (isSetPack && line && entry.variantId && order) {
+            const ctx = buildSetPackContext(order.lines || [], line, entry.variantId, fullTotals);
+            headroom = availableSetPackSets(ctx, previousStation(line, "Packing"));
+          } else if (line && entry.variantId) {
+            const formWithoutThis = { ...(formByVariant[entry.variantId] || emptyStationTotals()) };
+            if (qty > 0) {
+              formWithoutThis[emp.station] = Math.max(
+                0,
+                (Number(formWithoutThis[emp.station]) || 0) - qty
+              );
+            }
+            const totalsExcludingRow = liveStationTotals(fullTotals[entry.variantId], formWithoutThis);
+            const totalsMap = { ...allLiveTotalsByVariant, [entry.variantId]: totalsExcludingRow };
+            const setPackCtx =
+              emp.station === "Packing"
+                ? setPackContextFor(order, line, entry.variantId, totalsMap)
+                : null;
+            headroom = availableForStation(
+              line,
+              emp.station,
+              totalsExcludingRow,
+              liveAddons,
+              setPackCtx
+            );
+            isFirstStation = previousStation(line, emp.station) == null
+              && !lineSelectedAddons(line).some((a) => (a.afterStation || "Checking") === emp.station);
+          }
+
+          const setPackHint =
+            isSetPack && line && entry.variantId
+              ? (() => {
+                  const ctx = setPackContextFor(order, line, entry.variantId, fullTotals);
+                  if (!ctx) return null;
+                  const prev = previousStation(line, "Packing");
+                  const info = completeSetsReadyForPack(ctx, prev);
+                  if (!info) return null;
+                  const short = (info.bottlenecks || [])
+                    .filter((b) => b.partSets === info.sets)
+                    .map((b) => b.partName)
+                    .slice(0, 2);
+                  return {
+                    sets: info.sets,
+                    limitedBy: short,
+                    prev: prev || "upstream",
+                  };
+                })()
+              : null;
+
+          const blocked = stationSkipped || headroom === 0;
+          const needHint = isAddonWork
+            ? `Need ${(selectedAddon.requiresStations || []).join(" + ") || "upstream"}`
+            : setPackHint && headroom === 0
+              ? `Need complete set (${setPackHint.limitedBy.join(" + ") || "all parts"} at ${setPackHint.prev})`
+              : `Need ${previousStation(line, emp.station)
+                || lineSelectedAddons(line).find((a) => (a.afterStation || "Checking") === emp.station)?.name
+                || "upstream"}`;
+
+          // Design options: for sets use primary line variants (shared design names)
+          const variantSourceLine = isSetPack ? (packItem?.primaryLine || setGroupLines[0] || line) : line;
+          const variants = variantSourceLine?.variants || [];
+          const variant = variants.find((v) => v.variant_id === entry.variantId);
+
+          return (
+            <div key={ei} className="rounded-xl p-3 space-y-3" style={{ background: COLORS.bone, border: `1px solid ${COLORS.border}` }}>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="form-label">ATM</label>
+                  <select
+                    className="form-input"
+                    value={entry.orderId ?? ""}
+                    onChange={(e) => patchEntry(emp.id, ei, {
+                      orderId: e.target.value ? Number(e.target.value) : null,
+                      orderLineId: null,
+                      variantId: null,
+                      addonId: null,
+                      packItemKey: null,
+                      setGroupKey: null,
+                      qty: "",
+                    })}
+                  >
+                    <option value="">Select ATM…</option>
+                    {orders.map((o) => (
+                      <option key={o.order_id} value={o.order_id}>{o.atm_no} · {o.customer}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="form-label">{emp.station === "Packing" ? "Item / set" : "Item / part"}</label>
+                  {emp.station === "Packing" ? (
+                    <select
+                      className="form-input"
+                      value={packItem?.key || entry.packItemKey || ""}
+                      disabled={!order}
+                      onChange={(e) => {
+                        const item = packItems.find((i) => i.key === e.target.value);
+                        if (!item) {
+                          patchEntry(emp.id, ei, {
+                            packItemKey: null,
+                            setGroupKey: null,
+                            orderLineId: null,
+                            variantId: null,
+                            addonId: null,
+                            qty: "",
+                          });
+                          return;
+                        }
+                        if (item.type === "set") {
+                          patchEntry(emp.id, ei, {
+                            packItemKey: item.key,
+                            setGroupKey: item.groupKey,
+                            orderLineId: item.primaryLine.order_line_id,
+                            variantId: null,
+                            addonId: null,
+                            qty: "",
+                          });
+                        } else {
+                          patchEntry(emp.id, ei, {
+                            packItemKey: item.key,
+                            setGroupKey: null,
+                            orderLineId: item.line.order_line_id,
+                            variantId: null,
+                            addonId: null,
+                            qty: "",
+                          });
+                        }
+                      }}
+                    >
+                      <option value="">Select set or article…</option>
+                      {packItems.map((item) => (
+                        <option key={item.key} value={item.key}>{item.label}</option>
+                      ))}
+                    </select>
+                  ) : (
+                    <select
+                      className="form-input"
+                      value={entry.orderLineId ?? ""}
+                      disabled={!order}
+                      onChange={(e) => patchEntry(emp.id, ei, {
+                        orderLineId: e.target.value ? Number(e.target.value) : null,
+                        variantId: null,
+                        addonId: null,
+                        packItemKey: null,
+                        setGroupKey: null,
+                      })}
+                    >
+                      <option value="">Select part…</option>
+                      {lines.map((l) => {
+                        const stationCanAddon = addonsForStation(l, emp.station).length > 0;
+                        const skippedForStation = !stationCanAddon && skipMap(l)[emp.station];
+                        return (
+                          <option key={l.order_line_id} value={l.order_line_id} disabled={skippedForStation}>
+                            {l.article_name}{l.dimension_name ? ` · ${l.dimension_name}` : ""}{skippedForStation ? " (skipped)" : ""}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  )}
+                </div>
+                <div>
+                  <label className="form-label">Design / variant</label>
+                  <select
+                    className="form-input"
+                    value={entry.variantId ?? ""}
+                    disabled={!line && !isSetPack}
+                    onChange={(e) => patchEntry(emp.id, ei, {
+                      variantId: e.target.value || null,
+                      qty: "",
+                    })}
+                  >
+                    <option value="">Select…</option>
+                    {variants.map((v) => {
+                      const setQty = isSetPack
+                        ? Number(lineSetMeta(variantSourceLine)?.orderQuantity) ||
+                          Math.round((Number(v.quantity) || 0) / qtyPerSetOf(variantSourceLine))
+                        : Number(v.quantity || 0);
+                      return (
+                        <option key={v.variant_id} value={v.variant_id}>
+                          {v.variant_name} · order {setQty.toLocaleString()}
+                          {isSetPack ? " sets" : ""}
+                        </option>
+                      );
+                    })}
+                  </select>
+                </div>
+                {stationAddons.length > 0 && (
+                  <div className="sm:col-span-2">
+                    <label className="form-label">Work type</label>
+                    <select
+                      className="form-input"
+                      value={isAddonWork ? entry.addonId || "" : ""}
+                      disabled={!line}
+                      onChange={(e) => patchEntry(emp.id, ei, {
+                        addonId: e.target.value || null,
+                        qty: "",
+                      })}
+                    >
+                      <option value="">{emp.station} station work</option>
+                      {stationAddons.map((a) => (
+                        <option key={a.id} value={a.id}>
+                          {a.name} (add-on) · {formatPKR(a.addonRate)}/pc
+                        </option>
+                      ))}
+                    </select>
+                    <p className="text-[10.5px] mt-1" style={{ color: COLORS.graphiteLight }}>
+                      {emp.station} can log{" "}
+                      <strong style={{ color: COLORS.ink }}>{stationAddons.map((a) => a.name).join(" / ")}</strong>
+                      {" "}after prerequisites are done.
+                    </p>
+                  </div>
+                )}
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="form-label">
+                      {isSetPack ? "Sets to pack" : "Qty"}
+                      {isFirstStation && !isAddonWork
+                        ? " · can exceed order"
+                        : headroom != null
+                          ? isSetPack
+                            ? ` · max ${headroom.toLocaleString()} set${headroom === 1 ? "" : "s"}`
+                            : setPackHint
+                              ? ` · max ${headroom.toLocaleString()} (${setPackHint.sets} set${setPackHint.sets === 1 ? "" : "s"})`
+                              : ` · max ${headroom.toLocaleString()}`
+                          : ""}
+                    </label>
+                    <input
+                      type="number"
+                      min="0"
+                      max={headroom != null ? headroom : undefined}
+                      step="1"
+                      className="form-input"
+                      value={blocked ? "" : entry.qty}
+                      disabled={blocked || !entry.variantId}
+                      onChange={(e) => patchEntry(emp.id, ei, {
+                        qty: clampQtyToHeadroom(e.target.value, headroom),
+                      })}
+                      placeholder={headroom === 0 ? needHint : "0"}
+                      style={
+                        blocked
+                          ? { background: COLORS.boneDim, color: COLORS.graphiteLight }
+                          : undefined
+                      }
+                    />
+                  </div>
+                  <div>
+                    <label className="form-label">Defects</label>
+                    <input
+                      type="number"
+                      min="0"
+                      className="form-input"
+                      value={entry.defects}
+                      disabled={blocked}
+                      onChange={(e) => patchEntry(emp.id, ei, { defects: e.target.value })}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-[11px]" style={{ color: COLORS.graphiteLight }}>
+                  {stationSkipped ? (
+                    <span style={{ color: COLORS.rust }}>{emp.station} skipped — pick add-on work type if available</span>
+                  ) : headroom === 0 ? (
+                    <span style={{ color: COLORS.rust }}>{needHint}</span>
+                  ) : (
+                    <span>
+                      {isAddonWork ? `${selectedAddon.name} · ` : ""}
+                      {isSetPack
+                        ? `Packing sets · `
+                        : setPackHint
+                          ? `Complete sets ${setPackHint.sets.toLocaleString()} · `
+                          : ""}
+                      Rate {formatPKR(rate)}{isSetPack ? "/set" : ""} · {formatPKR(qty * rate)}
+                    </span>
+                  )}
+                </div>
+                {row.entries.length > 1 && (
+                  <button type="button" className="text-[11px] font-semibold" style={{ color: COLORS.rust }} onClick={() => removeEntry(emp.id, ei)}>
+                    Remove line
+                  </button>
+                )}
+              </div>
+
+              {line && entry.variantId && (
+                <div className="pt-1">
+                  {isSetPack ? (
+                    <>
+                      <p className="text-[11px] mb-1.5" style={{ color: COLORS.graphite }}>
+                        Packs as one set:{" "}
+                        {setGroupLines.map((gl) => `${qtyPerSetOf(gl)}× ${partNameOf(gl)}`).join(" + ")}
+                      </p>
+                      {setPackHint && (
+                        <p className="text-[11px]" style={{ color: COLORS.goldDim }}>
+                          {setPackHint.sets.toLocaleString()} complete set{setPackHint.sets === 1 ? "" : "s"} ready at {setPackHint.prev}
+                          {setPackHint.limitedBy?.length ? ` · limited by ${setPackHint.limitedBy.join(", ")}` : ""}
+                        </p>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <StationPills
+                        line={line}
+                        totals={live}
+                        orderQty={variant?.quantity ?? line.quantity}
+                        addonTotals={liveAddons}
+                      />
+                      <p className="text-[11px] mt-1.5" style={{ color: COLORS.goldDim }}>
+                        {describePipelineStatus(line, live, liveAddons)}
+                      </p>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+        <button
+          type="button"
+          className="inline-flex items-center gap-1.5 text-[12px] font-semibold px-3 py-2 rounded-lg"
+          style={{ background: COLORS.goldSoft, color: COLORS.goldDim }}
+          onClick={() => addEntry(emp.id, floorPick)}
+        >
+          <PlusIcon /> Add another line
+        </button>
+      </div>
+    );
   }
 
   return (
-    <div className="min-h-screen w-full flex" style={{ background: COLORS.bone, fontFamily: FONT }}>
-      <Sidebar mobileOpen={mobileNavOpen} onClose={() => setMobileNavOpen(false)} />
-
-      <div className="flex-1 min-w-0">
-        {/* Header Bar */}
-        <div className="flex items-center justify-between gap-2.5 px-4 sm:px-6 md:px-8 py-3.5 sticky top-0 z-30 backdrop-blur" style={{ background: `${COLORS.bone}F2`, borderBottom: `1px solid ${COLORS.border}` }}>
-          <div className="flex items-center gap-2.5 min-w-0 flex-1">
-            <button type="button" className="md:hidden p-2 rounded-lg btn-secondary shrink-0" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }} onClick={() => setMobileNavOpen(true)} aria-label="Open navigation">
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                <path d="M2 4h12M2 8h12M2 12h12" stroke={COLORS.ink} strokeWidth="1.4" strokeLinecap="round" />
-              </svg>
-            </button>
-            <div className="min-w-0 flex-1">
-              <h1 className="text-base sm:text-xl font-semibold truncate" style={{ color: COLORS.ink }}>Bulk Daily Work Entry</h1>
-              <p className="text-[12px] hidden sm:block truncate" style={{ color: COLORS.graphiteLight }}>Batch log unit output or mark leaves for floor staff</p>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2 shrink-0">
-            <button
-              type="button"
-              disabled={isDateLocked}
-              className="btn-secondary inline-flex items-center gap-1 text-[11.5px] sm:text-[12px] font-semibold px-2.5 sm:px-3 py-1.5 sm:py-2 rounded-lg disabled:opacity-50"
-              style={{ border: `1px solid ${COLORS.border}`, color: COLORS.graphite, background: COLORS.card }}
-              onClick={() => setCsvModalOpen(true)}
-            >
-              <UploadIcon /> <span className="hidden xs:inline">Import</span> CSV
-            </button>
-
-            {isDateLocked ? (
-              <span className="inline-flex items-center gap-1 text-[11.5px] sm:text-[12.5px] font-semibold px-3 py-1.5 rounded-lg" style={{ background: COLORS.boneDim, color: COLORS.graphite, border: `1px solid ${COLORS.border}` }}>
-                <LockIcon /> <span>Batch Locked</span>
-              </span>
-            ) : (
-              <button
-                type="button"
-                className="btn-primary inline-flex items-center gap-1 text-[11.5px] sm:text-[12.5px] font-semibold px-2.5 sm:px-3.5 py-1.5 sm:py-2 rounded-lg shrink-0"
-                style={{ background: COLORS.gold, color: COLORS.ink }}
-                onClick={handleRequestSave}
-              >
-                {savedSuccess ? <CheckIcon /> : <PlusIcon />} <span>{savedSuccess ? "Saved ✓" : "Save & Lock Batch"}</span>
-              </button>
-            )}
-
-            <div className="hidden sm:flex flex-col items-end leading-tight border-l pl-3" style={{ borderColor: COLORS.border }}>
-              <span className="text-[13px] font-medium" style={{ color: COLORS.ink }}>Admin</span>
-              <span className="text-[11px]" style={{ color: COLORS.graphiteLight }}>Administrator</span>
-            </div>
-            <div className="w-8 h-8 sm:w-9 sm:h-9 rounded-full flex items-center justify-center text-[12px] sm:text-[13px] font-semibold shrink-0" style={{ background: COLORS.ink, color: COLORS.gold, border: `2px solid ${COLORS.goldSoft}` }}>
-              A
-            </div>
-          </div>
-        </div>
-
-        <div className="p-5 md:p-8 max-w-7xl mx-auto">
-          {/* Success Toast */}
-          {savedSuccess && (
-            <div className="rounded-2xl px-5 py-3.5 mb-6 flex items-center justify-between flex-wrap gap-3 fade-in" style={{ background: COLORS.greenSoft, border: `1px solid ${COLORS.green}`, color: COLORS.green }}>
-              <div className="flex items-center gap-2.5 text-[12.5px] font-semibold">
-                <CheckIcon /> Daily Batch for {workDate} Permanently Locked &amp; Saved to Payroll!
-              </div>
-              <span className="text-[11.5px] font-medium">{summary.presentCount} present · {summary.leaveCount} on leave</span>
-            </div>
+    <AppShell
+      title="Production floor"
+      subtitle={`Karachi today · ${formatKarachiDMY(karachiToday)} · pick a date per employee`}
+      maxWidth="1400px"
+      showAvatar={false}
+      actions={
+        <button
+          type="button"
+          className="btn-primary text-[12.5px] font-semibold px-4 py-2 rounded-xl shrink-0"
+          style={{ background: COLORS.gold, color: COLORS.inkSurface, opacity: saving ? 0.7 : 1 }}
+          disabled={saving || loading}
+          onClick={handleSave}
+        >
+          {saving ? "Saving…" : "Save data"}
+        </button>
+      }
+    >
+          {loadError && (
+            <div className="rounded-xl px-4 py-3 mb-5 text-[12.5px]" style={{ background: COLORS.rustSoft, color: COLORS.rust }}>{loadError}</div>
           )}
-
           {saveError && (
-            <div className="rounded-2xl px-5 py-3.5 mb-6 flex items-center gap-2.5 fade-in" style={{ background: COLORS.rustSoft, border: `1px solid ${COLORS.rust}`, color: COLORS.rust }}>
-              <AlertIcon /> <span className="text-[12.5px] font-semibold">{saveError}</span>
+            <div className="rounded-xl px-4 py-3 mb-5 text-[12.5px]" style={{ background: COLORS.rustSoft, color: COLORS.rust }}>{saveError}</div>
+          )}
+          {savedSuccess && (
+            <div className="rounded-xl px-4 py-3 mb-5 text-[12.5px]" style={{ background: COLORS.greenSoft || COLORS.goldSoft, color: COLORS.green }}>
+              Data saved · ATM floor updated
             </div>
           )}
 
-          {/* Locked Date Read-Only Alert Banner */}
-          {isDateLocked && (
-            <div className="rounded-2xl px-5 py-3.5 mb-6 flex items-center justify-between flex-wrap gap-3 fade-in" style={{ background: COLORS.ink, color: COLORS.bone }}>
-              <div className="flex items-center gap-3">
-                <span className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0" style={{ background: COLORS.inkSoft, color: COLORS.gold }}>
-                  <LockIcon />
-                </span>
-                <div>
-                  <div className="text-[13px] font-semibold flex items-center gap-1.5" style={{ color: COLORS.gold }}>
-                    <LockIcon /> Historical Batch Locked — {workDate}
-                  </div>
-                  <div className="text-[11.5px]" style={{ color: COLORS.graphiteLight }}>
-                    Data for this date has already been submitted and locked for wage calculations. Editing is disabled to protect accounting.
-                  </div>
-                </div>
-              </div>
-              <span className="text-[11px] font-semibold px-2.5 py-1 rounded-full" style={{ background: COLORS.inkSoft, color: COLORS.gold }}>
-                Read-Only Record
-              </span>
-            </div>
-          )}
-
-          {/* Past Date Backdate Notice (if unlocked) */}
-          {!isDateLocked && isPastDate && (
-            <div className="rounded-2xl px-5 py-3.5 mb-6 flex items-center justify-between flex-wrap gap-3 fade-in" style={{ background: COLORS.goldSoft, border: `1px solid ${COLORS.gold}`, color: COLORS.goldDim }}>
-              <div className="flex items-center gap-2.5 text-[12.5px] font-semibold">
-                <AlertIcon /> Logging Missed Historical Data for <strong>{new Date(workDate).toLocaleDateString(undefined, { weekday: "short", year: "numeric", month: "short", day: "numeric" })}</strong>
-              </div>
-              <button
-                type="button"
-                className="btn-link text-[11.5px] font-semibold underline"
-                style={{ color: COLORS.ink }}
-                onClick={() => setWorkDate(getFormattedDate(0))}
-              >
-                Switch to Today ({todayStr})
-              </button>
-            </div>
-          )}
-
-          {/* Summary Banner */}
-          <div className="rounded-2xl px-5 py-3.5 mb-6 flex items-center justify-between flex-wrap gap-3 fade-in" style={{ background: COLORS.goldSoft, border: `1px solid ${COLORS.border}` }}>
-            <div className="flex items-center gap-3">
-              <div className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0" style={{ background: COLORS.card, color: COLORS.goldDim }}>
-                <BanknoteIcon />
-              </div>
-              <div>
-                <div className="text-[12.5px] font-semibold" style={{ color: COLORS.ink }}>
-                  Batch Payout Total for {workDate}: {formatPKR(summary.totalPayout)}
-                </div>
-                <div className="text-[11.5px]" style={{ color: COLORS.goldDim }}>
-                  {summary.totalUnits.toLocaleString()} units completed · {summary.presentCount} Present · {summary.leaveCount} On Leave
-                </div>
-              </div>
-            </div>
-
-            {isDateLocked ? (
-              <span className="text-[12px] font-semibold px-3.5 py-2 rounded-lg" style={{ background: COLORS.boneDim, color: COLORS.graphite, border: `1px solid ${COLORS.border}` }}>
-                🔒 Locked Record
-              </span>
-            ) : (
-              <button
-                type="button"
-                className="btn-primary text-[12px] font-semibold px-3.5 py-2 rounded-lg"
-                style={{ background: COLORS.ink, color: COLORS.gold }}
-                onClick={handleRequestSave}
-              >
-                Submit &amp; Lock Batch
-              </button>
-            )}
-          </div>
-
-          {/* Top Live Summary MiniStats */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-            <MiniStat index={0} icon={<UsersIcon />} label="Present Staff" value={`${summary.presentCount} staff`} sub={`of ${employees.length} total`} />
-            <MiniStat index={1} icon={<CalendarIcon />} label="Staff On Leave" value={`${summary.leaveCount} leave`} sub="marked for date" />
-            <MiniStat index={2} icon={<LayersIcon />} label="Total Daily Units" value={`${summary.totalUnits.toLocaleString()} pcs`} sub="floor output" />
-            <MiniStat index={3} icon={<BanknoteIcon />} label="Total Daily Payroll" value={formatPKR(summary.totalPayout)} sub="computed piece-rates" />
+            <MiniStat index={0} icon={<LayersIcon />} label="ATMs on floor" value={stats.atmCount} sub="open orders" />
+            <MiniStat index={1} icon={<UsersIcon />} label="Employees" value={employees.length} sub={`${stats.onLeave} leave today`} />
+            <MiniStat index={2} icon={<LayersIcon />} label="Draft entries" value={stats.entriesCount} sub={`${stats.totalQty.toLocaleString()} pcs`} />
+            <MiniStat index={3} icon={<BanknoteIcon />} label="Est. payout" value={formatPKR(stats.totalPayout)} sub="draft qty × rate" />
           </div>
 
-          {/* Date Picker & Backdating Shortcuts Bar */}
-          <div className="rounded-2xl p-4 mb-6 flex flex-wrap items-center justify-between gap-3 fade-in" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
-            <div className="flex items-center gap-3 flex-wrap">
-              <div className="flex items-center gap-2">
-                <span className="text-[11px] font-semibold uppercase" style={{ color: COLORS.graphite }}>Log Date:</span>
-                <input
-                  type="date"
-                  className="form-input text-[12.5px] font-semibold"
-                  style={{ width: 160 }}
-                  value={workDate}
-                  onChange={(e) => setWorkDate(e.target.value)}
+          {loading ? (
+            <div className="rounded-2xl p-12 text-center" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+              <p className="text-[13px]" style={{ color: COLORS.graphiteLight }}>Loading…</p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
+              <section className="xl:col-span-5">
+                <div className="mb-3">
+                  <h2 className="text-[15px] font-semibold" style={{ color: COLORS.ink }}>ATM floor</h2>
+                  <p className="text-[11.5px]" style={{ color: COLORS.graphiteLight }}>
+                    Stock left at each step · updates when you save
+                  </p>
+                </div>
+                {floorPick && (
+                  <div className="rounded-xl px-3 py-2 mb-3 text-[12px]" style={{ background: COLORS.goldSoft, border: `1px solid ${COLORS.border}`, color: COLORS.ink }}>
+                    Selected: <span className="font-semibold">{floorPick.line.article_name}</span>
+                    {" · "}{floorPick.variant.variant_name}
+                    <button type="button" className="ml-2 font-semibold" style={{ color: COLORS.rust }} onClick={() => setFloorPick(null)}>Clear</button>
+                  </div>
+                )}
+                <FloorBoard
+                  orders={orders}
+                  totalsForVariant={totalsForVariant}
+                  addonTotalsForVariant={addonTotalsForVariant}
+                  onPick={handleFloorPick}
                 />
-              </div>
+              </section>
 
-              {/* Quick Date Shortcuts */}
-              <div className="flex items-center gap-1.5 border-l pl-3" style={{ borderColor: COLORS.border }}>
-                <span className="text-[10.5px] font-semibold uppercase mr-1" style={{ color: COLORS.graphiteLight }}>Quick Date:</span>
-                <button
-                  type="button"
-                  className="btn-secondary text-[11px] font-semibold px-2.5 py-1 rounded-md"
-                  style={{
-                    border: `1px solid ${COLORS.border}`,
-                    background: workDate === getFormattedDate(0) ? COLORS.goldSoft : COLORS.bone,
-                    color: workDate === getFormattedDate(0) ? COLORS.goldDim : COLORS.graphite,
-                  }}
-                  onClick={() => setWorkDate(getFormattedDate(0))}
-                >
-                  Today
-                </button>
-                <button
-                  type="button"
-                  className="btn-secondary text-[11px] font-semibold px-2.5 py-1 rounded-md"
-                  style={{
-                    border: `1px solid ${COLORS.border}`,
-                    background: workDate === getFormattedDate(1) ? COLORS.goldSoft : COLORS.bone,
-                    color: workDate === getFormattedDate(1) ? COLORS.goldDim : COLORS.graphite,
-                  }}
-                  onClick={() => setWorkDate(getFormattedDate(1))}
-                >
-                  Yesterday
-                </button>
-              </div>
-            </div>
+              <section className="xl:col-span-7">
+                <div className="flex flex-wrap items-end justify-between gap-3 mb-3">
+                  <div>
+                    <h2 className="text-[15px] font-semibold" style={{ color: COLORS.ink }}>Add data</h2>
+                    <p className="text-[11.5px]" style={{ color: COLORS.graphiteLight }}>
+                      Change date → empty day = add · saved day = locked batch
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <div className="search-wrap">
+                      <SearchIcon />
+                      <input type="text" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search employee" />
+                    </div>
+                    <select className="form-input" style={{ width: "auto" }} value={stationFilter} onChange={(e) => setStationFilter(e.target.value)}>
+                      <option>All stations</option>
+                      <option>Cutting</option>
+                      <option>Stitching</option>
+                      <option>Checking</option>
+                      <option>Packing</option>
+                    </select>
+                  </div>
+                </div>
 
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                disabled={isDateLocked}
-                className="btn-secondary text-[11.5px] font-semibold px-3 py-1.5 rounded-lg disabled:opacity-50"
-                style={{ border: `1px solid ${COLORS.border}`, color: COLORS.graphite, background: COLORS.card }}
-                onClick={handleResetAllQuantities}
-              >
-                Reset Qty
-              </button>
-            </div>
-          </div>
-
-          {/* Filter & Search Bar */}
-          <div className="flex flex-wrap items-center gap-3 mb-4">
-            <div className="search-wrap">
-              <SearchIcon />
-              <input type="text" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search employee or station" />
-            </div>
-
-            <div className="select-wrap">
-              <select value={stationFilter} onChange={(e) => setStationFilter(e.target.value)}>
-                <option value="All stations">All stations</option>
-                <option value="Cutting">Cutting</option>
-                <option value="Stitching">Stitching</option>
-                <option value="Checking">Checking</option>
-                <option value="Packing">Packing</option>
-              </select>
-              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="select-caret">
-                <path d="M2.5 4.5L6 8l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            </div>
-
-            <div className="select-wrap">
-              <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
-                <option value="All status">All Attendance</option>
-                <option value="Present">Present Only</option>
-                <option value="On Leave">On Leave Only</option>
-              </select>
-              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="select-caret">
-                <path d="M2.5 4.5L6 8l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            </div>
-
-            <div className="select-wrap">
-              <select
-                disabled={isDateLocked}
-                value={bulkItemSelect}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  setBulkItemSelect(val);
-                  if (val) handleApplyBulkArticle(Number(val));
-                }}
-              >
-                <option value="">Set All Work Items</option>
-                {articles.map((a) => (
-                  <option key={a.id} value={a.id}>{a.name}</option>
-                ))}
-              </select>
-              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="select-caret">
-                <path d="M2.5 4.5L6 8l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            </div>
-
-            <span className="text-[11.5px] ml-auto" style={{ color: COLORS.graphiteLight }}>{filteredEmployees.length} shown</span>
-          </div>
-
-          {/* Main Table */}
-          <div className="rounded-2xl overflow-hidden panel fade-in" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
-            <div className="overflow-x-auto">
-              <table className="w-full text-[12.5px]">
-                <thead>
-                  <tr style={{ background: COLORS.boneDim }}>
-                    <th className="text-left font-semibold px-5 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Employee</th>
-                    <th className="text-left font-semibold px-5 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Station</th>
-                    <th className="text-left font-semibold px-5 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Attendance Status</th>
-                    <th className="text-left font-semibold px-3 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Work Article / Item</th>
-                    <th className="text-left font-semibold px-3 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Size</th>
-                    <th className="text-left font-semibold px-3 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Dimension</th>
-                    <th className="text-left font-semibold px-3 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Variant</th>
-                    <th className="text-left font-semibold px-3 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Assignment</th>
-                    <th className="text-right font-semibold px-3 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Rate / pc</th>
-                    <th className="text-right font-semibold px-3 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Completed Qty</th>
-                    <th className="text-right font-semibold px-3 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>QC Defects</th>
-                    <th className="text-right font-semibold px-3 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}>Net Daily Pay</th>
-                    <th className="text-center font-semibold px-3 py-2.5 uppercase text-[10.5px] tracking-wide" style={{ color: COLORS.graphite }}></th>
-                  </tr>
-                </thead>
-                <tbody>
+                <div className="flex flex-col gap-3">
                   {filteredEmployees.map((emp) => {
-                    const rowState = rows[emp.id] || emptyRow();
-                    const isLeave = rowState.isLeave;
-                    const entries = rowEntries(rowState);
-
-                    const employeeCell = (rowSpan) => (
-                      <td className="px-5 py-3.5 align-top" rowSpan={rowSpan}>
-                        <span className="flex items-center gap-3">
-                          <span
-                            className="w-9 h-9 rounded-full flex items-center justify-center text-[12px] font-semibold shrink-0 overflow-hidden"
-                            style={{ background: isLeave ? COLORS.rustSoft : COLORS.goldSoft, color: isLeave ? COLORS.rust : COLORS.goldDim }}
-                          >
-                            {emp.image ? (
-                              <img src={getImageUrl(emp.image)} alt={`${emp.name} profile`} className="w-full h-full object-cover" />
-                            ) : initials(emp.name)}
-                          </span>
-                          <span className="flex flex-col min-w-0">
-                            <span className="text-[13px] font-semibold truncate" style={{ color: COLORS.ink }}>{emp.name}</span>
-                            <span className="text-[11px]" style={{ color: COLORS.graphiteLight }}>{emp.id}</span>
-                          </span>
-                        </span>
-                      </td>
-                    );
-
-                    const stationCell = (rowSpan) => (
-                      <td className="px-5 py-3.5 align-top" rowSpan={rowSpan}>
-                        <span
-                          className="inline-flex items-center gap-1.5 text-[11px] font-medium px-2 py-1 rounded-full whitespace-nowrap"
-                          style={{ background: COLORS.boneDim, color: COLORS.graphite }}
-                        >
-                          <span className="w-1.5 h-1.5 rounded-full" style={{ background: STATION_COLORS[emp.station] || COLORS.gold }} />
-                          {emp.station}
-                        </span>
-                      </td>
-                    );
-
-                    const attendanceCell = (rowSpan) => (
-                      <td className="px-5 py-3.5 align-top" rowSpan={rowSpan}>
-                        <button
-                          type="button"
-                          disabled={isDateLocked}
-                          className="text-[11px] font-semibold px-2.5 py-1 rounded-full border transition-all disabled:opacity-75 disabled:cursor-not-allowed"
-                          style={{
-                            background: isLeave ? COLORS.rustSoft : COLORS.greenSoft,
-                            color: isLeave ? COLORS.rust : COLORS.green,
-                            borderColor: isLeave ? COLORS.rust : COLORS.green,
-                          }}
-                          onClick={() => toggleLeave(emp.id)}
-                          title={isDateLocked ? "Batch is locked" : "Click to toggle Present / On Leave"}
-                        >
-                          {isLeave ? "On Leave" : "Present ✓"}
-                        </button>
-                      </td>
-                    );
-
-                    if (isLeave) {
-                      return (
-                        <tr key={emp.id} className="tbl-row" style={{ borderTop: `1px solid ${COLORS.border}`, opacity: 0.75 }}>
-                          {employeeCell(1)}
-                          {stationCell(1)}
-                          {attendanceCell(1)}
-                          <td className="px-5 py-3.5" colSpan={4}>
-                            <span className="text-[11.5px] font-semibold px-3 py-1 rounded-lg inline-block" style={{ background: COLORS.rustSoft, color: COLORS.rust }}>
-                              On Leave — no production logged
-                            </span>
-                          </td>
-                          <td className="px-5 py-3.5 text-right" style={{ color: COLORS.graphiteLight }}>—</td>
-                          <td className="px-5 py-3.5 text-right" style={{ color: COLORS.graphiteLight }}>—</td>
-                          <td className="px-5 py-3.5 text-right" style={{ color: COLORS.graphiteLight }}>—</td>
-                          <td className="px-5 py-3.5 text-right font-semibold" style={{ color: COLORS.graphiteLight }}>PKR 0</td>
-                          <td></td>
-                        </tr>
-                      );
-                    }
+                    const row = rows[emp.id] || emptyDraft(karachiToday);
+                    const date = row.targetDate || karachiToday;
+                    const day = employeeDays[emp.id]?.dates?.[date] || null;
+                    const locked = Boolean(day);
+                    const stationColor = STATION_COLORS[emp.station] || COLORS.graphite;
+                    const open = activeEmpId === emp.id;
+                    const draftCount = row.isLeave
+                      ? 0
+                      : row.entries.filter((e) => (Number(e.qty) || 0) > 0).length;
+                    const minDate = emp.joiningDate || addDaysISO(karachiToday, -(LOOKBACK_DAYS - 1));
+                    const hintWin = catchUpWindow({
+                      today: karachiToday,
+                      joiningDate: emp.joiningDate,
+                      daysBack: 7,
+                    });
+                    const missing = missingDaysInWindow(hintWin.days, employeeDays[emp.id]?.dates || {})
+                      .filter((d) => d < karachiToday)
+                      .slice(0, 4);
 
                     return (
-                      <Fragment key={emp.id}>
-                        {entries.map((entry, entryIndex) => {
-                          const article = articles.find((a) => a.id === entry.articleId) || articles[0] || { rates: {}, sizes: [], dimensions: [], variants: [] };
-                          const rate = entryRate(entry, emp.station);
-                          const qtyNum = Number(entry.qty) || 0;
-                          const calculatedPay = Math.round(qtyNum * rate);
-                          const isFirst = entryIndex === 0;
-                          const isLast = entryIndex === entries.length - 1;
+                      <div key={emp.id} className="rounded-2xl overflow-hidden" style={{ background: COLORS.card, border: `1px solid ${open ? COLORS.gold : COLORS.border}` }}>
+                        <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3" style={{ background: COLORS.boneDim }}>
+                          <div className="flex items-center gap-3 min-w-0">
+                            <div className="w-9 h-9 rounded-full flex items-center justify-center text-[11px] font-bold shrink-0" style={{ background: COLORS.inkSurface, color: COLORS.gold }}>
+                              {initials(emp.name)}
+                            </div>
+                            <div className="min-w-0">
+                              <div className="text-[13px] font-semibold truncate" style={{ color: COLORS.ink }}>{emp.name}</div>
+                              <div className="text-[11px]" style={{ color: stationColor }}>
+                                {emp.station}
+                                {" · "}{formatKarachiDMY(date)}
+                                {locked ? " · locked" : " · no data yet"}
+                                {draftCount > 0 ? ` · +${draftCount} draft` : ""}
+                              </div>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            className="text-[12px] font-semibold px-3 py-1.5 rounded-lg"
+                            style={{
+                              background: open ? COLORS.inkSurface : COLORS.gold,
+                              color: open ? COLORS.gold : COLORS.inkSurface,
+                            }}
+                            onClick={() => (open ? setActiveEmpId(null) : openEmployee(emp.id))}
+                          >
+                            {open ? "Close" : "Open"}
+                          </button>
+                        </div>
 
-                          return (
-                            <tr
-                              key={`${emp.id}-${entryIndex}`}
-                              className="tbl-row"
-                              style={{ borderTop: isFirst ? `1px solid ${COLORS.border}` : "none", opacity: isDateLocked ? 0.75 : 1 }}
-                            >
-                              {isFirst && employeeCell(entries.length)}
-                              {isFirst && stationCell(entries.length)}
-                              {isFirst && attendanceCell(entries.length)}
+                        {open && (
+                          <div className="p-4 space-y-4">
+                            <div className="rounded-xl px-3 py-3 space-y-2" style={{ background: COLORS.goldSoft, border: `1px solid ${COLORS.border}` }}>
+                              <div className="flex flex-wrap items-end gap-3">
+                                <div className="min-w-[160px]">
+                                  <label className="form-label">Batch date (Karachi)</label>
+                                  <input
+                                    type="date"
+                                    className="form-input"
+                                    value={date}
+                                    min={minDate}
+                                    max={karachiToday}
+                                    onChange={(e) => setEmpDate(emp.id, e.target.value)}
+                                  />
+                                </div>
+                                <p className="text-[12px] pb-2" style={{ color: COLORS.ink }}>
+                                  Today is <span className="font-semibold">{formatKarachiDMY(karachiToday)}</span>
+                                  {" · "}showing <span className="font-semibold">{formatKarachiDMY(date)}</span>
+                                </p>
+                              </div>
+                              {missing.length > 0 && (
+                                <p className="text-[11.5px]" style={{ color: COLORS.graphite }}>
+                                  Hint — no data yet for{" "}
+                                  {missing.map((d, i) => (
+                                    <span key={d}>
+                                      {i > 0 ? ", " : ""}
+                                      <button
+                                        type="button"
+                                        className="font-semibold underline-offset-2 hover:underline"
+                                        style={{ color: COLORS.goldDim }}
+                                        onClick={() => setEmpDate(emp.id, d)}
+                                      >
+                                        {formatKarachiDMY(d)}
+                                      </button>
+                                    </span>
+                                  ))}
+                                  . Tap a date to open it.
+                                </p>
+                              )}
+                            </div>
 
-                              {/* Article Item Selector */}
-                              <td className="px-3 py-2">
-                                <div className="select-wrap" style={{ width: 150, opacity: isDateLocked ? 0.5 : 1 }}>
-                                  <select
-                                    disabled={isDateLocked}
-                                    className="w-full disabled:cursor-not-allowed"
-                                    value={entry.articleId ?? ""}
-                                    onChange={(e) => updateEntryArticle(emp.id, entryIndex, Number(e.target.value))}
+                            {locked && <LockedBatch date={date} day={day} />}
+
+                            {!locked && (
+                              <div className="space-y-3">
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <h3 className="text-[12px] font-semibold" style={{ color: COLORS.ink }}>
+                                    No data for {formatKarachiDMY(date)} — add below
+                                  </h3>
+                                  <label className="flex items-center gap-1.5 text-[11.5px] font-semibold" style={{ color: COLORS.rust }}>
+                                    <input
+                                      type="checkbox"
+                                      checked={row.isLeave}
+                                      onChange={(e) => patchRow(emp.id, {
+                                        isLeave: e.target.checked,
+                                        entries: e.target.checked ? [emptyEntry()] : row.entries,
+                                      })}
+                                    />
+                                    No work / leave
+                                  </label>
+                                </div>
+                                {row.isLeave ? (
+                                  <p className="text-[12.5px]" style={{ color: COLORS.graphite }}>
+                                    Will mark {formatKarachiDMY(date)} as no work on Save data.
+                                  </p>
+                                ) : (
+                                  renderEntryForm(emp, row)
+                                )}
+                              </div>
+                            )}
+
+                            {locked && day.status === "work" && (
+                              <div className="space-y-3">
+                                {!row.addingMore ? (
+                                  <button
+                                    type="button"
+                                    className="text-[12px] font-semibold px-3 py-2 rounded-lg"
+                                    style={{ background: COLORS.goldSoft, color: COLORS.goldDim }}
+                                    onClick={() => patchRow(emp.id, { addingMore: true, isLeave: false, entries: [emptyEntry()] })}
                                   >
-                                    {articles.map((a) => (
-                                      <option key={a.id} value={a.id}>{a.name}</option>
-                                    ))}
-                                  </select>
-                                  <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="select-caret">
-                                    <path d="M2.5 4.5L6 8l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-                                  </svg>
-                                </div>
-                              </td>
-
-                              {/* Size Selector — only meaningful once the article has sizes configured */}
-                              <td className="px-3 py-2">
-                                {article.sizes?.length > 0 ? (
-                                  <div className="select-wrap" style={{ width: 120, opacity: isDateLocked ? 0.5 : 1 }}>
-                                    <select
-                                      disabled={isDateLocked}
-                                      className="w-full disabled:cursor-not-allowed"
-                                      value={entry.sizeId ?? ""}
-                                      onChange={(e) => updateEntry(emp.id, entryIndex, "sizeId", e.target.value ? Number(e.target.value) : null)}
-                                    >
-                                      <option value="">Default</option>
-                                      {article.sizes.map((s) => (
-                                        <option key={s.size_id} value={s.size_id}>{s.size_name}{s.is_default ? " ★" : ""}</option>
-                                      ))}
-                                    </select>
-                                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="select-caret">
-                                      <path d="M2.5 4.5L6 8l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-                                    </svg>
-                                  </div>
+                                    Add more pcs to this day
+                                  </button>
                                 ) : (
-                                  <span className="text-[11px]" style={{ color: COLORS.graphiteLight }}>No sizes</span>
-                                )}
-                              </td>
-
-                              {/* Dimension Selector — only meaningful once the article has dimensions configured */}
-                              <td className="px-3 py-2">
-                                {article.dimensions?.length > 0 ? (
-                                  <div className="select-wrap" style={{ width: 140, opacity: isDateLocked ? 0.5 : 1 }}>
-                                    <select
-                                      disabled={isDateLocked}
-                                      className="w-full disabled:cursor-not-allowed"
-                                      value={entry.dimensionId ?? ""}
-                                      onChange={(e) => updateEntry(emp.id, entryIndex, "dimensionId", e.target.value ? Number(e.target.value) : null)}
-                                    >
-                                      <option value="">Default</option>
-                                      {article.dimensions.map((d) => (
-                                        <option key={d.dimension_id} value={d.dimension_id}>{d.dimension_name}</option>
-                                      ))}
-                                    </select>
-                                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="select-caret">
-                                      <path d="M2.5 4.5L6 8l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-                                    </svg>
-                                  </div>
-                                ) : (
-                                  <span className="text-[11px]" style={{ color: COLORS.graphiteLight }}>No dimensions</span>
-                                )}
-                              </td>
-
-                              {/* Variant Selector — only meaningful once the article has variants (color/design) */}
-                              <td className="px-3 py-2">
-                                {article.variants?.length > 0 ? (
-                                  <div className="select-wrap" style={{ width: 140, opacity: isDateLocked ? 0.5 : 1 }}>
-                                    <select
-                                      disabled={isDateLocked}
-                                      className="w-full disabled:cursor-not-allowed"
-                                      value={entry.variantId ?? ""}
-                                      onChange={(e) => updateEntry(emp.id, entryIndex, "variantId", e.target.value ? Number(e.target.value) : null)}
-                                    >
-                                      <option value="">Default (no variant)</option>
-                                      {article.variants.map((v) => (
-                                        <option key={v.variant_id} value={v.variant_id}>{variantLabel(v)}</option>
-                                      ))}
-                                    </select>
-                                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="select-caret">
-                                      <path d="M2.5 4.5L6 8l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-                                    </svg>
-                                  </div>
-                                ) : (
-                                  <span className="text-[11px]" style={{ color: COLORS.graphiteLight }}>No variants</span>
-                                )}
-                              </td>
-
-                              {/* Assignment: Side Stock now, For Order reserved for once order records exist */}
-                              <td className="px-3 py-2">
-                                <div className="flex flex-col gap-1">
-                                  <div className="select-wrap" style={{ width: 112, opacity: isDateLocked ? 0.5 : 1 }}>
-                                    <select
-                                      disabled={isDateLocked}
-                                      className="w-full disabled:cursor-not-allowed"
-                                      value={entry.allocation || "SIDE_STOCK"}
-                                      onChange={(e) => updateEntry(emp.id, entryIndex, "allocation", e.target.value)}
-                                    >
-                                      <option value="SIDE_STOCK">Side Stock</option>
-                                      <option value="FOR_ORDER">For Order</option>
-                                    </select>
-                                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="select-caret">
-                                      <path d="M2.5 4.5L6 8l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-                                    </svg>
-                                  </div>
-                                  {entry.allocation === "FOR_ORDER" && (() => {
-                                    const options = openOrderLinesFor(entry);
-                                    return (
-                                      <div className="select-wrap" style={{ width: 160, opacity: isDateLocked ? 0.5 : 1 }}>
-                                        <select
-                                          disabled={isDateLocked}
-                                          className="w-full disabled:cursor-not-allowed"
-                                          value={entry.orderId ?? ""}
-                                          onChange={(e) => updateEntry(emp.id, entryIndex, "orderId", e.target.value ? Number(e.target.value) : null)}
-                                        >
-                                          <option value="">{options.length ? "Select order" : "No open orders"}</option>
-                                          {options.map((o) => (
-                                            <option key={o.orderId} value={o.orderId}>{o.label}</option>
-                                          ))}
-                                        </select>
-                                        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="select-caret">
-                                          <path d="M2.5 4.5L6 8l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-                                        </svg>
-                                      </div>
-                                    );
-                                  })()}
-                                </div>
-                              </td>
-
-                              {/* Piece Rate */}
-                              <td className="px-3 py-2 text-right font-medium whitespace-nowrap" style={{ color: COLORS.graphite }}>
-                                PKR {rate.toFixed(2)}
-                              </td>
-
-                              {/* Qty Input */}
-                              <td className="px-3 py-2 text-right">
-                                <input
-                                  type="number"
-                                  min="0"
-                                  disabled={isDateLocked}
-                                  className="form-input text-right font-semibold disabled:bg-stone-100 disabled:cursor-not-allowed"
-                                  style={{ width: 68 }}
-                                  value={entry.qty}
-                                  onFocus={(e) => e.target.select()}
-                                  onChange={(e) => updateEntry(emp.id, entryIndex, "qty", e.target.value)}
-                                />
-                              </td>
-
-                              {/* QC Defects Input */}
-                              <td className="px-3 py-2 text-right">
-                                <input
-                                  type="number"
-                                  min="0"
-                                  disabled={isDateLocked}
-                                  className="form-input text-right font-semibold text-amber-700 disabled:bg-stone-100 disabled:cursor-not-allowed"
-                                  style={{ width: 56 }}
-                                  value={entry.defects || 0}
-                                  onFocus={(e) => e.target.select()}
-                                  onChange={(e) => updateEntry(emp.id, entryIndex, "defects", e.target.value)}
-                                />
-                              </td>
-
-                              {/* Calculated Pay */}
-                              <td className="px-3 py-2 text-right font-semibold whitespace-nowrap" style={{ color: calculatedPay > 0 ? COLORS.ink : COLORS.graphiteLight }}>
-                                {formatPKR(calculatedPay)}
-                              </td>
-
-                              {/* Row actions: remove this article line / add another */}
-                              <td className="px-3 py-2.5">
-                                <div className="flex items-center justify-center gap-1">
-                                  {entries.length > 1 && !isDateLocked && (
+                                  <>
+                                    <h3 className="text-[12px] font-semibold" style={{ color: COLORS.ink }}>
+                                      Add more · {formatKarachiDMY(date)}
+                                    </h3>
+                                    {renderEntryForm(emp, row)}
                                     <button
                                       type="button"
-                                      className="btn-secondary p-1 rounded-md"
-                                      style={{ border: `1px solid ${COLORS.border}`, color: COLORS.rust }}
-                                      title="Remove this article line"
-                                      onClick={() => removeEntry(emp.id, entryIndex)}
+                                      className="text-[11px] font-semibold"
+                                      style={{ color: COLORS.graphite }}
+                                      onClick={() => patchRow(emp.id, { addingMore: false, entries: [emptyEntry()] })}
                                     >
-                                      <CloseIcon />
+                                      Cancel add more
                                     </button>
-                                  )}
-                                  {isLast && !isDateLocked && (
-                                    <button
-                                      type="button"
-                                      className="btn-secondary p-1 rounded-md"
-                                      style={{ border: `1px solid ${COLORS.border}`, color: COLORS.goldDim }}
-                                      title="Add another article for this employee"
-                                      onClick={() => addEntry(emp.id)}
-                                    >
-                                      <PlusIcon />
-                                    </button>
-                                  )}
-                                </div>
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </Fragment>
+                                  </>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
                     );
                   })}
-                </tbody>
-              </table>
-            </div>
-
-            {/* Bottom Summary Bar */}
-            <div className="px-6 py-4 flex items-center justify-between flex-wrap gap-3" style={{ background: COLORS.boneDim, borderTop: `1px solid ${COLORS.border}` }}>
-              <div className="flex items-center gap-5 text-[12.5px]">
-                <div>
-                  <span style={{ color: COLORS.graphite }}>Target Date: </span>
-                  <strong style={{ color: COLORS.ink }}>{workDate} {isDateLocked ? "(Locked)" : "(Editable)"}</strong>
+                  {!filteredEmployees.length && (
+                    <div className="rounded-2xl p-12 text-center" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+                      <p className="text-[13px]" style={{ color: COLORS.graphiteLight }}>No employees match your filters.</p>
+                    </div>
+                  )}
                 </div>
-                <div>
-                  <span style={{ color: COLORS.graphite }}>Attendance: </span>
-                  <strong style={{ color: COLORS.ink }}>{summary.presentCount} Present · {summary.leaveCount} On Leave</strong>
-                </div>
-                <div>
-                  <span style={{ color: COLORS.graphite }}>Total Units: </span>
-                  <strong style={{ color: COLORS.ink }}>{summary.totalUnits.toLocaleString()} pcs</strong>
-                </div>
-                <div>
-                  <span style={{ color: COLORS.graphite }}>Total Daily Pay: </span>
-                  <strong style={{ color: COLORS.ink }}>{formatPKR(summary.totalPayout)}</strong>
-                </div>
-              </div>
-
-              {isDateLocked ? (
-                <span className="text-[12.5px] font-semibold px-4 py-2 rounded-lg" style={{ background: COLORS.card, color: COLORS.graphite, border: `1px solid ${COLORS.border}` }}>
-                  🔒 Batch Locked
-                </span>
-              ) : (
-                <button
-                  type="button"
-                  className="btn-primary text-[12.5px] font-semibold px-4 py-2 rounded-lg"
-                  style={{ background: COLORS.gold, color: COLORS.ink }}
-                  onClick={handleRequestSave}
-                >
-                  Save &amp; Lock Batch
-                </button>
-              )}
+              </section>
             </div>
-          </div>
-        </div>
-      </div>
-
-      {/* Confirmation & Permanent Lock Modal */}
-      {confirmModalOpen && (
-        <div className="modal-overlay fixed inset-0 z-70 flex items-center justify-center p-4" onClick={() => setConfirmModalOpen(false)}>
-          <div
-            className="modal-pop w-full max-w-md rounded-2xl p-6 shadow-2xl"
-            style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, fontFamily: FONT }}
-            onClick={(e) => e.stopPropagation()}
-            role="dialog"
-            aria-modal="true"
-          >
-            <div className="flex items-center gap-3 mb-4">
-              <span className="w-10 h-10 rounded-xl flex items-center justify-center text-[18px] shrink-0" style={{ background: COLORS.goldSoft, color: COLORS.goldDim, border: `1px solid ${COLORS.border}` }}>
-                🔒
-              </span>
-              <div>
-                <h3 className="text-[16px] font-semibold" style={{ color: COLORS.ink }}>Confirm &amp; Lock Daily Batch</h3>
-                <p className="text-[11.5px]" style={{ color: COLORS.graphiteLight }}>Permanent submission for {workDate}</p>
-              </div>
-            </div>
-
-            <div className="rounded-xl p-3.5 mb-4 text-[12px] leading-relaxed" style={{ background: COLORS.rustSoft, border: `1px solid ${COLORS.rust}`, color: COLORS.rust }}>
-              <strong>⚠️ Warning — Cannot be changed:</strong> Once submitted, this batch for <strong>{workDate}</strong> will be permanently <strong>LOCKED</strong>. You will not be able to edit unit quantities or piece-rates later to ensure payroll integrity.
-            </div>
-
-            <div className="rounded-xl p-3.5 mb-5 space-y-2 text-[12.5px]" style={{ background: COLORS.boneDim, border: `1px solid ${COLORS.border}` }}>
-              <div className="flex items-center justify-between">
-                <span style={{ color: COLORS.graphite }}>Log Date:</span>
-                <strong style={{ color: COLORS.ink }}>{workDate}</strong>
-              </div>
-              <div className="flex items-center justify-between">
-                <span style={{ color: COLORS.graphite }}>Floor Output:</span>
-                <strong style={{ color: COLORS.ink }}>{summary.totalUnits.toLocaleString()} pcs</strong>
-              </div>
-              <div className="flex items-center justify-between">
-                <span style={{ color: COLORS.graphite }}>Attendance:</span>
-                <strong style={{ color: COLORS.ink }}>{summary.presentCount} Present · {summary.leaveCount} On Leave</strong>
-              </div>
-              <div className="flex items-center justify-between pt-1 border-t" style={{ borderColor: COLORS.border }}>
-                <span className="font-semibold" style={{ color: COLORS.ink }}>Total Payout:</span>
-                <strong className="text-[14px]" style={{ color: COLORS.goldDim }}>{formatPKR(summary.totalPayout)}</strong>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-end gap-3">
-              <button
-                type="button"
-                className="btn-secondary text-[12.5px] font-semibold px-4 py-2.5 rounded-xl"
-                style={{ border: `1px solid ${COLORS.border}`, color: COLORS.graphite }}
-                onClick={() => setConfirmModalOpen(false)}
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                className="btn-primary text-[12.5px] font-bold px-5 py-2.5 rounded-xl shadow-md"
-                style={{ background: COLORS.gold, color: COLORS.ink }}
-                onClick={handleConfirmAndLockSave}
-              >
-                Yes, Lock &amp; Save Batch
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* CSV Import Modal */}
-      {csvModalOpen && (
-        <div className="modal-overlay fixed inset-0 z-70 flex items-center justify-center p-4" onClick={() => setCsvModalOpen(false)}>
-          <div
-            className="modal-pop w-full max-w-lg rounded-2xl p-6"
-            style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}
-            onClick={(e) => e.stopPropagation()}
-            role="dialog"
-            aria-modal="true"
-          >
-            <div className="flex items-center justify-between mb-3">
-              <h3 className="text-[16px] font-semibold" style={{ color: COLORS.ink }}>Import Daily Data CSV / Excel</h3>
-              <button type="button" className="btn-secondary p-1.5 rounded-lg" style={{ border: `1px solid ${COLORS.border}` }} onClick={() => setCsvModalOpen(false)}>
-                <CloseIcon />
-              </button>
-            </div>
-            <p className="text-[12px] mb-4" style={{ color: COLORS.graphiteLight }}>
-              Paste lines from Excel or CSV formatted as: <code>Employee ID or Name, Quantity or "Leave", Article Name</code>
-            </p>
-            <textarea
-              className="form-input h-36 font-mono text-[12px] mb-4"
-              placeholder={`EMP-101, 150, Bedsheet Set — King\nEMP-105, Leave, Duvet Cover Set — Double\nEMP-103, 190, Bedsheet Set — King`}
-              value={csvText}
-              onChange={(e) => setCsvText(e.target.value)}
-            />
-            <div className="flex items-center justify-end gap-3">
-              <button
-                type="button"
-                className="btn-secondary text-[12.5px] font-semibold px-4 py-2 rounded-lg"
-                style={{ border: `1px solid ${COLORS.border}`, color: COLORS.graphite }}
-                onClick={() => setCsvModalOpen(false)}
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                className="btn-primary text-[12.5px] font-semibold px-4 py-2 rounded-lg"
-                style={{ background: COLORS.gold, color: COLORS.ink }}
-                onClick={handleImportCsv}
-              >
-                Parse &amp; Load into Sheet
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+          )}
 
       <style>{`
-        * { box-sizing: border-box; }
-
-        @keyframes fadeInUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-        @keyframes modalPop { from { opacity: 0; transform: scale(0.96) translateY(6px); } to { opacity: 1; transform: scale(1) translateY(0); } }
-        @keyframes overlayIn { from { opacity: 0; } to { opacity: 1; } }
-
-        .fade-in { animation: fadeInUp 0.5s cubic-bezier(0.16, 1, 0.3, 1) both; }
-
-        .modal-overlay { background: rgba(28,25,23,0.5); backdrop-filter: blur(2px); animation: overlayIn 0.18s ease both; }
-        .modal-pop { animation: modalPop 0.22s cubic-bezier(0.16, 1, 0.3, 1) both; }
-
-        .stat-card, .panel, .btn-primary, .btn-secondary, .btn-link, .tbl-row {
-          transition: transform .18s ease, box-shadow .18s ease, background-color .18s ease, border-color .18s ease, color .18s ease;
-        }
-        .stat-card:hover { transform: translateY(-3px); box-shadow: 0 14px 28px -18px rgba(28,25,23,0.28); border-color: ${COLORS.gold} !important; }
-        .panel:hover { box-shadow: 0 10px 26px -18px rgba(28,25,23,0.22); }
-        .tbl-row:hover { background: ${COLORS.boneDim}77; }
-
-        .btn-primary:hover:not(:disabled) { filter: brightness(1.06); transform: translateY(-1px); box-shadow: 0 8px 18px -8px rgba(184,135,61,0.5); }
-        .btn-primary:active:not(:disabled) { transform: translateY(0); }
-        .btn-secondary:hover:not(:disabled) { border-color: ${COLORS.gold} !important; color: ${COLORS.goldDim} !important; background: ${COLORS.goldSoft}55 !important; }
-
         .form-label { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; color: ${COLORS.graphite}; margin-bottom: 4px; display: block; }
         .form-input {
           font-family: ${FONT}; font-size: 12.5px; color: ${COLORS.ink}; background: ${COLORS.card};
           border: 1px solid ${COLORS.border}; border-radius: 8px; padding: 7px 10px; outline: none; width: 100%;
-          transition: border-color .2s ease, box-shadow .2s ease;
         }
-        .form-input:hover:not(:disabled), .form-input:focus:not(:disabled) { border-color: ${COLORS.gold}; box-shadow: 0 0 0 3px ${COLORS.goldSoft}66; }
-
-        button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid ${COLORS.gold}; outline-offset: 2px; }
-
-        .select-wrap { position: relative; display: inline-flex; align-items: center; }
-        .select-wrap select {
-          appearance: none; font-family: ${FONT}; font-size: 12.5px; font-weight: 500;
-          color: ${COLORS.ink}; background: ${COLORS.card}; border: 1px solid ${COLORS.border};
-          border-radius: 8px; padding: 8px 28px 8px 12px; cursor: pointer; outline: none;
-          transition: border-color 0.2s ease, box-shadow 0.2s ease;
-        }
-        .select-wrap select:hover:not(:disabled), .select-wrap select:focus:not(:disabled) { border-color: ${COLORS.gold}; box-shadow: 0 0 0 3px ${COLORS.goldSoft}66; }
-        .select-caret { position: absolute; right: 10px; pointer-events: none; }
-
+        .form-input:hover, .form-input:focus { border-color: ${COLORS.gold}; box-shadow: 0 0 0 3px ${COLORS.goldSoft}66; }
+        .form-input:disabled { background: ${COLORS.boneDim}; color: ${COLORS.graphiteLight}; }
         .search-wrap { position: relative; display: inline-flex; align-items: center; }
         .search-wrap svg { position: absolute; left: 10px; color: ${COLORS.graphiteLight}; pointer-events: none; }
         .search-wrap input {
           font-family: ${FONT}; font-size: 12.5px; color: ${COLORS.ink}; background: ${COLORS.card};
-          border: 1px solid ${COLORS.border}; border-radius: 8px; padding: 8px 12px 8px 30px;
-          outline: none; width: 240px; transition: border-color 0.2s ease, box-shadow 0.2s ease;
+          border: 1px solid ${COLORS.border}; border-radius: 8px; padding: 8px 12px 8px 30px; outline: none; width: 200px;
         }
-        .search-wrap input::placeholder { color: ${COLORS.graphiteLight}; }
-        .search-wrap input:hover, .search-wrap input:focus { border-color: ${COLORS.gold}; box-shadow: 0 0 0 3px ${COLORS.goldSoft}66; }
-
-        .nav-item { transition: background .18s ease, transform .18s ease, color .18s ease; }
-        .nav-item:hover:not(:disabled) { background: ${COLORS.inkSoft} !important; transform: translateX(2px); }
-
-        @media (max-width: 640px) {
-          .search-wrap, .select-wrap { width: 100%; }
-          .search-wrap input { width: 100% !important; }
-          .select-wrap select { width: 100% !important; }
-        }
-
-        ::-webkit-scrollbar { width: 8px; height: 8px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: ${COLORS.boneBorder}; border-radius: 8px; }
-        ::-webkit-scrollbar-thumb:hover { background: ${COLORS.graphiteLight}; }
+        .btn-primary:hover { filter: brightness(1.06); }
       `}</style>
-    </div>
+    </AppShell>
   );
 }

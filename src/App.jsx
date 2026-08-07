@@ -6,8 +6,10 @@
 
 import { Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider, useAuth } from "./context/AuthContext";
+import { ThemeScope } from "./context/ThemeContext";
 import ProtectedRoute from "./components/auth/ProtectedRoute";
 import PublicRoute from "./components/auth/PublicRoute";
+import AdminRoute from "./components/auth/AdminRoute";
 import Login from "./pages/Login";
 import Overview from "./pages/Overview";
 import EmployeesPage from "./pages/Employees";
@@ -15,7 +17,10 @@ import OrdersPage from "./pages/Orders";
 import CostingPage from "./pages/Costing";
 import ForecastPage from "./pages/Forecast";
 import DailyEntryPage from "./pages/DailyEntry";
-import ReportsPage from "./pages/Reports";
+import ShipmentPage from "./pages/Shipment";
+import SecurityHistoryPage from "./pages/SecurityHistory";
+import DailyExpensesPage from "./pages/DailyExpenses";
+import PayoutsPage from "./pages/Payouts";
 
 function RootRedirect() {
   const { isAuthenticated } = useAuth();
@@ -25,7 +30,8 @@ function RootRedirect() {
 export default function App() {
   return (
     <AuthProvider>
-      <Routes>
+      <ThemeScope>
+        <Routes>
         <Route path="/" element={<RootRedirect />} />
         <Route
           path="/login"
@@ -52,6 +58,14 @@ export default function App() {
           }
         />
         <Route
+          path="/payouts"
+          element={
+            <AdminRoute>
+              <PayoutsPage />
+            </AdminRoute>
+          }
+        />
+        <Route
           path="/orders"
           element={
             <ProtectedRoute>
@@ -60,11 +74,35 @@ export default function App() {
           }
         />
         <Route
-          path="/daily-entry"
+          path="/shipment"
           element={
             <ProtectedRoute>
-              <DailyEntryPage />
+              <ShipmentPage />
             </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/security"
+          element={
+            <ProtectedRoute>
+              <SecurityHistoryPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/expenses"
+          element={
+            <ProtectedRoute>
+              <DailyExpensesPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/daily-entry"
+          element={
+            <AdminRoute>
+              <DailyEntryPage />
+            </AdminRoute>
           }
         />
         <Route
@@ -83,16 +121,9 @@ export default function App() {
             </ProtectedRoute>
           }
         />
-        <Route
-          path="/reports"
-          element={
-            <ProtectedRoute>
-              <ReportsPage />
-            </ProtectedRoute>
-          }
-        />
-        <Route path="*" element={<RootRedirect />} />
-      </Routes>
+          <Route path="*" element={<RootRedirect />} />
+        </Routes>
+      </ThemeScope>
     </AuthProvider>
   );
 }

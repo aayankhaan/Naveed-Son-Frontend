@@ -9,11 +9,12 @@ import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { FONT, LOGIN_COLORS as COLORS } from "../constants/theme";
 import { useAuth } from "../context/AuthContext";
+import ThemeToggle from "../components/ui/ThemeToggle";
 
 function SeamDivider() {
   const stitches = Array.from({ length: 28 });
   return (
-    <div className="relative hidden md:flex flex-col items-center justify-center w-6 shrink-0" style={{ background: COLORS.ink }}>
+    <div className="relative hidden md:flex flex-col items-center justify-center w-6 shrink-0" style={{ background: COLORS.inkSurface }}>
       <div className="flex flex-col gap-1.75">
         {stitches.map((_, i) => (
           <span
@@ -86,7 +87,7 @@ function TaglineSlider() {
         >
           <h1
             className="text-3xl md:text-4xl leading-tight font-semibold mb-4"
-            style={{ color: COLORS.bone, fontFamily: FONT }}
+            style={{ color: COLORS.onDark, fontFamily: FONT }}
           >
             {slide.title}
           </h1>
@@ -177,12 +178,12 @@ export default function LoginPanel() {
     <div className="min-h-screen w-full flex flex-col md:flex-row" style={{ fontFamily: FONT }}>
       <div
         className="flex md:w-[42%] flex-col justify-between p-6 sm:p-10 md:p-12 relative overflow-hidden fade-in"
-        style={{ background: `linear-gradient(160deg, ${COLORS.ink} 0%, ${COLORS.inkSoft} 100%)` }}
+        style={{ background: `linear-gradient(160deg, ${COLORS.inkSurface} 0%, ${COLORS.inkSoft} 100%)` }}
       >
         <div className="flex items-center gap-3.5">
           <Logo />
           <div>
-            <div className="text-[15px] font-semibold leading-tight" style={{ color: COLORS.bone, fontFamily: FONT }}>
+            <div className="text-[15px] font-semibold leading-tight" style={{ color: COLORS.onDark, fontFamily: FONT }}>
               Naveed &amp; Sons
             </div>
             <div className="text-[11px] tracking-widest uppercase" style={{ color: COLORS.graphiteLight }}>
@@ -202,13 +203,27 @@ export default function LoginPanel() {
 
       <SeamDivider />
 
-      <div className="flex-1 flex items-center justify-center p-6 sm:p-8" style={{ background: COLORS.bone }}>
-        <div className="w-full max-w-sm fade-in-up">
-          <h2 className="text-2xl font-semibold mb-1" style={{ color: COLORS.ink, fontFamily: FONT }}>
+      <div
+        className="flex-1 flex items-center justify-center p-6 sm:p-8 relative"
+        style={{
+          background: COLORS.bone,
+          backgroundImage: `radial-gradient(700px 320px at 80% 0%, color-mix(in srgb, ${COLORS.goldSoft} 70%, transparent), transparent 60%)`,
+        }}
+      >
+        <div
+          className="w-full max-w-sm fade-in-up rounded-2xl p-6 sm:p-7"
+          style={{
+            background: COLORS.card,
+            border: `1px solid ${COLORS.border}`,
+            boxShadow: "var(--shadow-md)",
+          }}
+        >
+          <h2 className="text-2xl font-semibold mb-1 tracking-tight" style={{ color: COLORS.ink, fontFamily: FONT, letterSpacing: "-0.02em" }}>
             Sign in
           </h2>
-          <p className="text-sm mb-8" style={{ color: COLORS.graphite }}>
-            Enter your admin credentials to open the dashboard.
+          <p className="text-sm mb-7" style={{ color: COLORS.graphite }}>
+            Enter your credentials to open the floor desk.
+            Admin can change data · Management is view-only.
           </p>
 
           <form onSubmit={handleSubmit} className={`space-y-5 ${shake ? "shake" : ""}`}>
@@ -224,7 +239,7 @@ export default function LoginPanel() {
                   autoComplete="username"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  placeholder="e.g. admin"
+                  placeholder="admin or management"
                   className="field-input"
                 />
               </div>
@@ -259,7 +274,7 @@ export default function LoginPanel() {
             </div>
 
             {error && (
-              <div className="text-[12px] rounded-md px-3 py-2 flex items-center gap-2 error-in" style={{ background: "#F1E1DB", color: COLORS.rust }}>
+              <div className="text-[12px] rounded-md px-3 py-2 flex items-center gap-2 error-in" style={{ background: COLORS.rustSoft, color: COLORS.rust }}>
                 <span className="mt-0.75 w-1.5 h-1.5 rounded-full shrink-0" style={{ background: COLORS.rust }} />
                 {error}
               </div>
@@ -270,8 +285,11 @@ export default function LoginPanel() {
             </button>
           </form>
 
-          <div className="mt-8 pt-5 text-[11px] text-center" style={{ borderTop: `1px solid ${COLORS.boneDim}`, color: COLORS.graphiteLight }}>
-            Trouble signing in? Contact your administrator.
+          <div className="mt-8 pt-5" style={{ borderTop: `1px solid ${COLORS.boneDim}` }}>
+            <ThemeToggle className="mx-auto max-w-[190px]" />
+            <div className="mt-4 text-[11px] text-center" style={{ color: COLORS.graphiteLight }}>
+              Trouble signing in? Contact your administrator.
+            </div>
           </div>
 
           <div className="mt-4 text-[10px] text-center tracking-wide" style={{ color: COLORS.graphiteLight }}>
@@ -336,14 +354,14 @@ export default function LoginPanel() {
           font-size: 14px;
           font-weight: 600;
           letter-spacing: 0.02em;
-          color: ${COLORS.bone};
-          background: ${COLORS.ink};
+          color: ${COLORS.btnFg};
+          background: ${COLORS.btnBg};
           border: none;
           cursor: pointer;
           transition: transform 0.15s ease, box-shadow 0.2s ease, background 0.2s ease, opacity 0.2s ease;
         }
         .signin-btn:hover:not(:disabled) {
-          background: ${COLORS.inkSoft};
+          background: ${COLORS.btnBgHover};
           box-shadow: 0 6px 16px rgba(28,25,23,0.25);
           transform: translateY(-1px);
         }

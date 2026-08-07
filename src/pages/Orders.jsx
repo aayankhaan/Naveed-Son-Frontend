@@ -6,6 +6,7 @@
 // ========================================
 
 import { useState, useMemo, useEffect } from "react";
+import { Link } from "react-router-dom";
 import { pdf } from "@react-pdf/renderer";
 import InvoiceDocument from "./InvoiceDocument";
 import { FONT, COLORS } from "../constants/theme";
@@ -13,9 +14,136 @@ import Sidebar from "../components/layout/Sidebar";
 import MiniStat from "../components/ui/MiniStat";
 import { SearchIcon, ChevronIcon, CloseIcon } from "../components/icons/CommonIcons";
 import { apiFetch } from "../lib/api";
+import { flattenSetOrderToLines, articleToLegacy, calcArticleOrderSuggestion } from "../lib/manufacturingPricing";
+import {
+  STATION_ORDER,
+  emptyStationTotals,
+  stationWipTotals,
+  lineSelectedAddons,
+  skipMap,
+  addonWipQty,
+} from "../lib/productionFlow";
+import SetOrderBuilder, {
+  DepartmentToggles,
+  DEFAULT_DEPARTMENTS,
+} from "../components/orders/SetOrderBuilder";
+import OrderAtmExpenses from "../components/orders/OrderAtmExpenses";
+import { useAuth } from "../context/AuthContext";
+import ReadOnlyBanner from "../components/auth/ReadOnlyBanner";
+import {
+  emptyDesignColor,
+  equalSplit,
+  designColorSplitError,
+  buildVariantsFromDesignColors,
+  designColorsFromVariants,
+} from "../lib/orderDesignColor";
+
+async function readApiError(res, fallback) {
+  try {
+    const data = await res.json();
+    return data.error || fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 function formatPKR(n) {
   return `PKR ${Math.round(n).toLocaleString()}`;
+}
+
+const STATION_SHORT = { Cutting: "Cut", Stitching: "Sti", Checking: "Che", Packing: "Pac" };
+
+function aggregateStationTotals(variantIds, stationsByVariant) {
+  const totals = emptyStationTotals();
+  for (const vid of variantIds || []) {
+    const t = stationsByVariant?.[vid] || emptyStationTotals();
+    STATION_ORDER.forEach((s) => {
+      totals[s] = (Number(totals[s]) || 0) + (Number(t[s]) || 0);
+    });
+  }
+  return totals;
+}
+
+function aggregateAddonTotals(variantIds, addonsByVariant) {
+  const out = {};
+  for (const vid of variantIds || []) {
+    const a = addonsByVariant?.[vid] || {};
+    Object.entries(a).forEach(([id, qty]) => {
+      out[id] = (Number(out[id]) || 0) + (Number(qty) || 0);
+    });
+  }
+  return out;
+}
+
+/** Cut → Sti → Button → Che → Pac with WIP counts for a part (or one design). */
+function PartStationFlow({ line, cumulativeTotals, addonTotals, compact = false }) {
+  const skips = skipMap(line);
+  const live = cumulativeTotals || emptyStationTotals();
+  const wip = stationWipTotals(line, live);
+  const enabled = STATION_ORDER.filter((s) => !skips[s]);
+  const last = enabled[enabled.length - 1];
+  const addons = lineSelectedAddons(line);
+  const textSize = compact ? "text-[9.5px]" : "text-[10.5px]";
+  const pad = compact ? "px-1.5 py-0.5" : "px-2 py-0.5";
+
+  return (
+    <div className="flex flex-wrap items-center gap-1">
+      {STATION_ORDER.map((s, i) => {
+        const skipped = skips[s];
+        const qty = Number(wip[s]) || 0;
+        const finishedHere = s === last;
+        const afterPills = addons.filter((a) => {
+          const req = a.requiresStations || [];
+          let lastReq = null;
+          let lastIdx = -1;
+          for (const r of req) {
+            const idx = STATION_ORDER.indexOf(r);
+            if (idx > lastIdx) {
+              lastIdx = idx;
+              lastReq = r;
+            }
+          }
+          return lastReq === s;
+        });
+        return (
+          <span key={s} className="inline-flex items-center gap-1">
+            {i > 0 && <span className={textSize} style={{ color: COLORS.graphiteLight }}>→</span>}
+            <span
+              className={`${textSize} font-semibold ${pad} rounded`}
+              style={{
+                background: skipped ? COLORS.boneDim : finishedHere && qty > 0 ? COLORS.goldSoft : COLORS.card,
+                color: skipped ? COLORS.graphiteLight : COLORS.ink,
+                textDecoration: skipped ? "line-through" : "none",
+                border: `1px solid ${COLORS.border}`,
+              }}
+              title={`${s}: ${skipped ? "skipped" : `${qty.toLocaleString()} at station`}`}
+            >
+              {STATION_SHORT[s]} {skipped ? "—" : qty.toLocaleString()}
+            </span>
+            {afterPills.map((a) => {
+              const sitting = addonWipQty(a, live, addonTotals?.[a.id]);
+              return (
+              <span key={a.id} className="inline-flex items-center gap-1">
+                <span className={textSize} style={{ color: COLORS.graphiteLight }}>→</span>
+                <span
+                  className={`${textSize} font-semibold ${pad} rounded`}
+                  style={{
+                    background: sitting > 0 ? COLORS.goldSoft : COLORS.card,
+                    color: COLORS.ink,
+                    border: `1px solid ${COLORS.border}`,
+                  }}
+                  title={`${a.name}: ${sitting.toLocaleString()} waiting (not yet ${(a.afterStation || "Checking").toLowerCase()})`}
+                >
+                  {a.name} {sitting.toLocaleString()}
+                </span>
+              </span>
+              );
+            })}
+          </span>
+        );
+      })}
+    </div>
+  );
 }
 
 function formatDate(dateStr) {
@@ -35,30 +163,42 @@ function transformOrder(order) {
     customer: order.customer,
     date: formatDate(order.order_date),
     notes: order.notes || "",
-    lines: (order.lines || []).map((line) => ({
-      orderId: line.order_line_id,
-      articleId: line.article_id,
-      article: line.article_name,
-      articleNo: String(line.article_id),
-      sizeId: line.size_id,
-      size: line.size_name || "—",
-      dimensionId: line.dimension_id,
-      dimensions: line.dimension_name || "—",
-      packPerCtn: line.pack_per_ctn,
-      quantity: line.quantity,
-      readyQuantity: (line.variants || []).reduce((s, v) => s + (Number(v.ready_quantity) || 0), 0),
-      netWeight: Number(line.net_weight) || 0,
-      grossWeight: Number(line.gross_weight) || 0,
-      cartonSize: line.carton_size || "—",
-      cbm: Number(line.cbm) || 0,
-      colors: (line.variants || []).map((v) => ({
-        variantId: v.variant_id,
-        design: v.variant_name || "Default",
-        barcode: v.barcode || "—",
-        quantity: v.quantity,
-        readyQuantity: Number(v.ready_quantity) || 0,
-      })),
-    })),
+    billNo: order.bill_no || null,
+    paymentStatus: order.payment_status || null,
+    lines: (order.lines || []).map((line) => {
+      const setMeta = line.set_order_meta || line.set_meta || null;
+      return {
+        orderId: line.order_line_id,
+        articleId: line.article_id,
+        article: line.article_name,
+        articleNo: String(line.article_id),
+        sizeId: line.size_id,
+        size: line.dimension_name || line.size_name || setMeta?.sizeText || "—",
+        dimensionId: line.dimension_id,
+        dimensions: line.dimension_name || setMeta?.sizeText || "—",
+        packPerCtn: line.pack_per_ctn,
+        quantity: line.quantity,
+        readyQuantity: (line.variants || []).reduce((s, v) => s + (Number(v.ready_quantity) || 0), 0),
+        netWeight: Number(line.net_weight) || 0,
+        grossWeight: Number(line.gross_weight) || 0,
+        cartonSize: line.carton_size || "—",
+        cbm: Number(line.cbm) || 0,
+        setMeta,
+        skip_cutting: Boolean(line.skip_cutting),
+        skip_stitching: Boolean(line.skip_stitching),
+        skip_checking: Boolean(line.skip_checking),
+        skip_packing: Boolean(line.skip_packing),
+        set_order_meta: setMeta,
+        set_meta: setMeta,
+        colors: (line.variants || []).map((v) => ({
+          variantId: v.variant_id,
+          design: v.variant_name || "Default",
+          barcode: v.barcode || "—",
+          quantity: v.quantity,
+          readyQuantity: Number(v.ready_quantity) || 0,
+        })),
+      };
+    }),
   };
 }
 
@@ -70,14 +210,137 @@ function calcLine(line) {
   return { ...line, reqdCtns, readyCtns, percent };
 }
 
+function setOrderKey(line) {
+  const meta = line.setMeta;
+  if (!meta?.setId) return null;
+  if (meta.groupId) return String(meta.groupId);
+  const setQty =
+    meta.orderQuantity != null && meta.orderQuantity !== ""
+      ? Number(meta.orderQuantity)
+      : meta.quantityPerSet
+        ? Math.round(line.quantity / (Number(meta.quantityPerSet) || 1))
+        : line.quantity;
+  const designs = (meta.designColors || []).map((d) => d.name || "").join("|");
+  return `${meta.setId}::${meta.configurationId || ""}::${line.packPerCtn}::${setQty}::${designs}`;
+}
+
+function setQuantityOf(line) {
+  const meta = line.setMeta;
+  if (!meta) return 0;
+  if (meta.orderQuantity != null && meta.orderQuantity !== "") return Number(meta.orderQuantity) || 0;
+  const qps = Number(meta.quantityPerSet) || 0;
+  return qps > 0 ? Math.round(line.quantity / qps) : line.quantity;
+}
+
+function partDisplayName(line) {
+  const meta = line.setMeta;
+  if (meta?.partName) return meta.partName;
+  const setName = meta?.setName;
+  if (setName && line.article?.startsWith(`${setName} · `)) {
+    return line.article.slice(setName.length + 3);
+  }
+  return line.article;
+}
+
+/** Complete sets ready = bottleneck across parts (fewest finished set-equivalents). */
+function readySetsOf(setItem) {
+  if (!setItem?.lines?.length) return 0;
+  let minSets = Infinity;
+  for (const line of setItem.lines) {
+    const qps = Number(line.setMeta?.quantityPerSet) || 1;
+    const setsReady = Math.floor((Number(line.readyQuantity) || 0) / qps);
+    minSets = Math.min(minSets, setsReady);
+  }
+  return minSets === Infinity ? 0 : minSets;
+}
+
+/** Group flattened set parts under one set card; keep standalone articles as-is. */
+function groupLinesForDisplay(lines) {
+  const items = [];
+  const setMap = new Map();
+
+  for (const line of lines) {
+    const key = setOrderKey(line);
+    if (!key) {
+      items.push({ type: "article", key: `art-${line.orderId}`, line });
+      continue;
+    }
+    let group = setMap.get(key);
+    if (!group) {
+      group = {
+        type: "set",
+        key,
+        setName: line.setMeta.setName || "Set",
+        configurationName: line.setMeta.sizeText || line.setMeta.configurationName || "",
+        setQuantity: setQuantityOf(line),
+        setSellingPerUnit: line.setMeta.setSellingPerUnit,
+        packPerCtn: Number(line.packPerCtn) || 6,
+        cartonSize: line.cartonSize,
+        cbm: line.cbm,
+        netWeight: line.netWeight,
+        grossWeight: line.grossWeight,
+        lines: [],
+      };
+      setMap.set(key, group);
+      items.push(group);
+    }
+    group.lines.push(line);
+  }
+
+  return items.map((item) => {
+    if (item.type !== "set") return item;
+    const pack = Number(item.packPerCtn) || 1;
+    const setQty = Number(item.setQuantity) || 0;
+    const readySets = readySetsOf(item);
+    const reqdCtns = Math.ceil(setQty / pack);
+    const readyCtns = Math.ceil(readySets / pack);
+    const percent = setQty ? Math.min(100, Math.round((readySets / setQty) * 100)) : 0;
+    const totalQty = item.lines.reduce((s, l) => s + l.quantity, 0);
+    const totalReady = item.lines.reduce((s, l) => s + l.readyQuantity, 0);
+    return {
+      ...item,
+      readySets,
+      reqdCtns,
+      readyCtns,
+      percent,
+      totalQty,
+      totalReady,
+    };
+  });
+}
+
 function calcGroup(group) {
   const lines = group.lines.map(calcLine);
-  const totalQuantity = lines.reduce((s, l) => s + l.quantity, 0);
-  const totalReady = lines.reduce((s, l) => s + l.readyQuantity, 0);
-  const totalReqdCtns = lines.reduce((s, l) => s + l.reqdCtns, 0);
-  const totalReadyCtns = lines.reduce((s, l) => s + l.readyCtns, 0);
+  const displayItems = groupLinesForDisplay(lines);
+  const totalQuantity = displayItems.reduce((sum, item) => {
+    if (item.type === "set") return sum + (Number(item.setQuantity) || 0);
+    return sum + (Number(item.line.quantity) || 0);
+  }, 0);
+  // Sets pack as one unit — count cartons once per set group, not per part
+  const totalReqdCtns = displayItems.reduce((sum, item) => {
+    if (item.type === "set") return sum + (Number(item.reqdCtns) || 0);
+    return sum + (Number(item.line.reqdCtns) || 0);
+  }, 0);
+  const totalReadyCtns = displayItems.reduce((sum, item) => {
+    if (item.type === "set") return sum + (Number(item.readyCtns) || 0);
+    return sum + (Number(item.line.readyCtns) || 0);
+  }, 0);
+  const totalReady = displayItems.reduce((sum, item) => {
+    if (item.type === "set") return sum + (Number(item.readySets) || 0);
+    return sum + (Number(item.line.readyQuantity) || 0);
+  }, 0);
   const percent = totalQuantity ? Math.min(100, Math.round((totalReady / totalQuantity) * 100)) : 0;
-  return { ...group, lines, totalQuantity, totalReady, totalReqdCtns, totalReadyCtns, percent };
+  return {
+    ...group,
+    lines,
+    displayItems,
+    itemCount: displayItems.length,
+    totalQuantity,
+    totalReady,
+    totalReqdCtns,
+    totalReadyCtns,
+    percent,
+  };
 }
 
 function statusOf(percent) {
@@ -86,9 +349,32 @@ function statusOf(percent) {
   return "Not started";
 }
 
+function isShipped(group) {
+  return group?.paymentStatus === "shipped";
+}
+
+function isAwaitingShipment(group) {
+  if (isShipped(group)) return false;
+  const ps = group?.paymentStatus;
+  return (
+    ps === "awaiting_shipment" ||
+    ps === "awaiting_payment" ||
+    Boolean(group?.billNo)
+  );
+}
+
+/** Packing progress status, overridden by payment lifecycle when applicable. */
+function orderLifecycleStatus(group) {
+  if (isShipped(group)) return "Shipped";
+  if (isAwaitingShipment(group)) return "Waiting for Shipment";
+  return statusOf(group.percent);
+}
+
 function statusColors(status) {
+  if (status === "Shipped") return { bg: COLORS.ink, fg: COLORS.gold };
   if (status === "Complete") return { bg: COLORS.greenSoft, fg: COLORS.green };
   if (status === "In progress") return { bg: COLORS.goldSoft, fg: COLORS.goldDim };
+  if (status === "Waiting for Shipment") return { bg: COLORS.goldSoft, fg: COLORS.goldDim };
   return { bg: COLORS.rustSoft, fg: COLORS.rust };
 }
 
@@ -193,56 +479,58 @@ function StatusBadge({ status }) {
   );
 }
 
-function OrderGroupCard({ group, index, onOpen, onInvoice, onPartialSplit }) {
-  const status = statusOf(group.percent);
-  const c = statusColors(status);
+function OrderGroupCard({ group, index, onOpen }) {
+  const lifecycle = orderLifecycleStatus(group);
+  const awaiting = isAwaitingShipment(group);
+  const shipped = isShipped(group);
+  const packStatus = statusOf(group.percent);
+  const c = statusColors(lifecycle);
   return (
     <div
       className="order-card fade-in rounded-2xl p-5 cursor-pointer"
-      style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, animationDelay: `${index * 50}ms` }}
+      style={{
+        background: COLORS.card,
+        border: `1px solid ${shipped ? COLORS.ink : COLORS.border}`,
+        animationDelay: `${index * 50}ms`,
+        opacity: shipped ? 0.92 : 1,
+      }}
       onClick={() => onOpen(group)}
     >
       <div className="flex items-start justify-between gap-3 flex-wrap">
         <div className="flex items-start gap-3 min-w-0">
-          <div className="w-11 h-11 rounded-xl flex items-center justify-center shrink-0 text-[12px] font-bold" style={{ background: COLORS.boneDim, color: COLORS.goldDim }}>
+          <div className="w-11 h-11 rounded-xl flex items-center justify-center shrink-0 text-[12px] font-bold" style={{ background: shipped ? COLORS.ink : COLORS.boneDim, color: COLORS.goldDim }}>
             {group.atmNo}
           </div>
           <div className="min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
               <h3 className="text-[14px] font-semibold" style={{ color: COLORS.ink }}>{group.customer}</h3>
-              <StatusBadge status={status} />
+              <StatusBadge status={lifecycle} />
+              {group.billNo ? (
+                <span className="text-[10px] font-semibold px-2 py-0.5 rounded" style={{ background: COLORS.boneDim, color: COLORS.graphite }}>
+                  {group.billNo}
+                </span>
+              ) : null}
             </div>
             <p className="text-[11.5px] mt-0.5" style={{ color: COLORS.graphiteLight }}>
-              ATM {group.atmNo} · {group.lines.length} order line{group.lines.length === 1 ? "" : "s"} · {group.date}
+              ATM {group.atmNo} · {group.itemCount ?? group.lines.length} item{(group.itemCount ?? group.lines.length) === 1 ? "" : "s"} · {group.date}
+              {shipped ? " · closed" : awaiting ? " · waiting for shipment" : ""}
             </p>
           </div>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          {status === "Complete" ? (
-            <button
-              type="button"
-              className="btn-primary inline-flex items-center gap-1.5 text-[11.5px] font-semibold px-3 py-1.5 rounded-lg shrink-0"
-              style={{ background: COLORS.green, color: COLORS.card }}
-              onClick={(e) => {
-                e.stopPropagation();
-                onInvoice(group);
-              }}
-            >
-              <InvoiceIcon /> Create invoice
-            </button>
-          ) : (
-            <button
-              type="button"
-              className="btn-secondary inline-flex items-center gap-1 text-[11px] font-semibold px-2.5 py-1.5 rounded-lg shrink-0"
-              style={{ border: `1px solid ${COLORS.border}`, color: COLORS.graphite, background: COLORS.card }}
-              onClick={(e) => {
-                e.stopPropagation();
-                onPartialSplit(group);
-              }}
-            >
-              <ScissorsIcon /> Partial Split
-            </button>
-          )}
+          {shipped ? (
+            <span className="text-[11.5px] font-semibold px-3 py-1.5 rounded-lg" style={{ background: COLORS.ink, color: COLORS.gold }}>
+              Order closed
+            </span>
+          ) : awaiting ? (
+            <span className="text-[11.5px] font-semibold px-3 py-1.5 rounded-lg" style={{ background: COLORS.goldSoft, color: COLORS.goldDim }}>
+              Ready to ship
+            </span>
+          ) : packStatus === "Complete" ? (
+            <span className="text-[11.5px] font-semibold px-3 py-1.5 rounded-lg" style={{ background: COLORS.greenSoft, color: COLORS.green }}>
+              Packing complete
+            </span>
+          ) : null}
         </div>
       </div>
 
@@ -280,7 +568,179 @@ function OrderGroupCard({ group, index, onOpen, onInvoice, onPartialSplit }) {
   );
 }
 
-function OrderDetailModal({ group, onClose, onInvoice }) {
+function OrderPartBody({ line, cartonMode = "own", stationTotals = {}, addonTotals = {} }) {
+  // Set parts share one carton plan at set level — only show piece progress here
+  const showCartons = cartonMode === "own";
+  const variantIds = (line.colors || []).map((c) => c.variantId).filter(Boolean);
+  const lineStations = aggregateStationTotals(variantIds, stationTotals);
+  const lineAddons = aggregateAddonTotals(variantIds, addonTotals);
+  const multiDesign = (line.colors || []).length > 1;
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-5 gap-4 p-5">
+      <div className="lg:col-span-2">
+        <div className="text-[10.5px] font-semibold uppercase tracking-wide mb-2" style={{ color: COLORS.graphiteLight }}>Design / Color</div>
+        <div className="flex flex-col gap-2">
+          {line.colors.map((c, i) => {
+            const designStations = aggregateStationTotals([c.variantId], stationTotals);
+            const designAddons = aggregateAddonTotals([c.variantId], addonTotals);
+            return (
+              <div key={i} className="rounded-lg px-2.5 py-2" style={{ background: COLORS.bone }}>
+                <div className="flex items-center justify-between text-[12px] gap-2">
+                  <span style={{ color: COLORS.ink }}>{c.design}</span>
+                  <span className="text-[10.5px] shrink-0" style={{ color: COLORS.graphiteLight }}>
+                    packed {(c.readyQuantity || 0).toLocaleString()} / {c.quantity.toLocaleString()}
+                  </span>
+                </div>
+                {multiDesign && (
+                  <div className="mt-1.5">
+                    <PartStationFlow
+                      line={line}
+                      cumulativeTotals={designStations}
+                      addonTotals={designAddons}
+                      compact
+                    />
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="lg:col-span-3">
+        <div className="mb-3">
+          <div className="text-[10.5px] font-semibold uppercase tracking-wide mb-1.5" style={{ color: COLORS.graphiteLight }}>
+            Floor progress
+          </div>
+          <PartStationFlow line={line} cumulativeTotals={lineStations} addonTotals={lineAddons} />
+          <p className="text-[10.5px] mt-1.5" style={{ color: COLORS.graphiteLight }}>
+            Numbers are pieces sitting at each step (not yet moved on).
+          </p>
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+          <StatBlock label="Quantity" value={line.quantity.toLocaleString()} />
+          <StatBlock label="Ready Qty" value={line.readyQuantity.toLocaleString()} />
+          <StatBlock label="% Against order" value={`${line.percent}%`} highlight />
+          {showCartons && (
+            <>
+              <StatBlock label="Pack / CTN" value={line.packPerCtn} />
+              <StatBlock label="Reqd CTNS" value={line.reqdCtns.toLocaleString()} />
+              <StatBlock label="Ready CTNS" value={line.readyCtns.toLocaleString()} />
+              <StatBlock label="Carton numbering" value={`1 to ${line.reqdCtns}`} />
+              <StatBlock label="Net / Gross wt" value={`${line.netWeight} / ${line.grossWeight} kg`} />
+              <StatBlock label="Carton size / CBM" value={`${line.cartonSize} · ${line.cbm}`} />
+            </>
+          )}
+        </div>
+        <div className="h-1.5 rounded-full overflow-hidden mt-4" style={{ background: COLORS.boneDim }}>
+          <div className="h-1.5 rounded-full due-bar" style={{ width: `${line.percent}%`, background: statusColors(statusOf(line.percent)).fg }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ArticleLineCard({ line, stationTotals, addonTotals }) {
+  return (
+    <div className="rounded-2xl overflow-hidden" style={{ border: `1px solid ${COLORS.border}` }}>
+      <div className="flex items-center justify-between flex-wrap gap-2 px-5 py-3" style={{ background: COLORS.boneDim }}>
+        <div className="flex items-center gap-2.5 flex-wrap">
+          <span className="text-[12px] font-bold px-2 py-1 rounded" style={{ background: COLORS.ink, color: COLORS.gold }}>#{line.orderId}</span>
+          <span className="text-[12.5px] font-semibold" style={{ color: COLORS.ink }}>{line.article}</span>
+          <span className="text-[11.5px]" style={{ color: COLORS.graphite }}>{line.size} · {line.dimensions}</span>
+        </div>
+        <StatusBadge status={statusOf(line.percent)} />
+      </div>
+      <OrderPartBody line={line} stationTotals={stationTotals} addonTotals={addonTotals} />
+    </div>
+  );
+}
+
+function SetOrderGroupCard({ item, index, stationTotals, addonTotals }) {
+  const [open, setOpen] = useState(true);
+  const status = statusOf(item.percent);
+  const configLabel = item.configurationName || "—";
+  const pack = Number(item.packPerCtn) || 6;
+  const reqdCtns = Number(item.reqdCtns) || 0;
+  const readyCtns = Number(item.readyCtns) || 0;
+
+  return (
+    <div className="rounded-2xl overflow-hidden" style={{ border: `1px solid ${COLORS.border}` }}>
+      <div style={{ background: COLORS.boneDim }}>
+        <button
+          type="button"
+          className="w-full flex items-center justify-between gap-3 px-5 pt-4 pb-3 text-left"
+          onClick={() => setOpen((v) => !v)}
+        >
+          <div className="flex items-center gap-3 min-w-0 flex-wrap">
+            <span className="text-[12px] font-bold px-2 py-1 rounded shrink-0" style={{ background: COLORS.ink, color: COLORS.gold }}>
+              {index}
+            </span>
+            <div className="min-w-0">
+              <div className="text-[14px] font-semibold" style={{ color: COLORS.ink }}>
+                {Number(item.setQuantity || 0).toLocaleString()}× {item.setName}
+              </div>
+              <div className="text-[11.5px] mt-0.5" style={{ color: COLORS.graphiteLight }}>
+                {configLabel} · {item.lines.length} part{item.lines.length === 1 ? "" : "s"} packed together
+                {item.setSellingPerUnit != null ? ` · PKR ${Math.round(Number(item.setSellingPerUnit) || 0).toLocaleString()}/set` : ""}
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-2.5 shrink-0">
+            <StatusBadge status={status} />
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" style={{ transform: open ? "rotate(180deg)" : "none", transition: "transform 0.15s" }}>
+              <path d="M3.5 5.5L7 9l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </div>
+        </button>
+
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 px-5 pb-3">
+          <StatBlock label="Sets" value={Number(item.setQuantity || 0).toLocaleString()} />
+          <StatBlock label="Pack / CTN" value={pack} />
+          <StatBlock label="Reqd CTNS" value={reqdCtns.toLocaleString()} />
+          <StatBlock label="Carton numbering" value={reqdCtns ? `1 to ${reqdCtns}` : "—"} />
+          <StatBlock label="Ready sets" value={Number(item.readySets || 0).toLocaleString()} />
+          <StatBlock label="Ready CTNS" value={readyCtns.toLocaleString()} />
+          <StatBlock label="% Against order" value={`${item.percent}%`} highlight />
+          <StatBlock label="Net / Gross wt" value={`${item.netWeight ?? 0} / ${item.grossWeight ?? 0} kg`} />
+        </div>
+        <div className="px-5 pb-4">
+          <div className="h-1.5 rounded-full overflow-hidden" style={{ background: COLORS.card }}>
+            <div className="h-1.5 rounded-full due-bar" style={{ width: `${item.percent}%`, background: statusColors(status).fg }} />
+          </div>
+        </div>
+      </div>
+
+      {open && (
+        <div className="flex flex-col" style={{ borderTop: `1px solid ${COLORS.border}` }}>
+          <div className="px-5 pt-3 text-[10.5px] font-semibold uppercase tracking-wide" style={{ color: COLORS.graphiteLight }}>
+            Parts in this set · production qty
+          </div>
+          {item.lines.map((line, partIdx) => (
+            <div key={line.orderId} style={partIdx > 0 ? { borderTop: `1px solid ${COLORS.border}` } : undefined}>
+              <div className="flex items-center justify-between flex-wrap gap-2 px-5 pt-4 pb-1">
+                <div className="flex items-center gap-2.5 flex-wrap">
+                  <span className="text-[11px] font-bold px-2 py-0.5 rounded" style={{ background: COLORS.goldSoft, color: COLORS.goldDim }}>
+                    #{line.orderId}
+                  </span>
+                  <span className="text-[13px] font-semibold" style={{ color: COLORS.ink }}>{partDisplayName(line)}</span>
+                  <span className="text-[11.5px]" style={{ color: COLORS.graphite }}>{line.dimensions}</span>
+                </div>
+                <StatusBadge status={statusOf(line.percent)} />
+              </div>
+              <OrderPartBody line={line} cartonMode="shared" stationTotals={stationTotals} addonTotals={addonTotals} />
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function OrderDetailModal({ group, onClose, onEdit, onDelete, isDeleting, stationTotals = {}, addonTotals = {}, canWrite = true }) {
+  const [detailTab, setDetailTab] = useState("floor");
+
   useEffect(() => {
     const onKey = (e) => e.key === "Escape" && onClose();
     document.addEventListener("keydown", onKey);
@@ -291,8 +751,15 @@ function OrderDetailModal({ group, onClose, onInvoice }) {
     };
   }, [onClose]);
 
+  useEffect(() => {
+    setDetailTab("floor");
+  }, [group?.id, group?.order_id]);
+
   if (!group) return null;
-  const status = statusOf(group.percent);
+  const lifecycle = orderLifecycleStatus(group);
+  const shipped = isShipped(group);
+  const displayItems = group.displayItems || groupLinesForDisplay(group.lines);
+  const orderId = group.order_id || group.orderId || group.id;
 
   return (
     <div className="modal-overlay fixed inset-0 z-60 flex items-center justify-center p-3 sm:p-6" onClick={onClose}>
@@ -307,128 +774,158 @@ function OrderDetailModal({ group, onClose, onInvoice }) {
           <div className="min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
               <h2 className="text-[16px] font-semibold" style={{ color: COLORS.ink }}>{group.customer}</h2>
-              <StatusBadge status={status} />
+              <StatusBadge status={lifecycle} />
             </div>
-            <p className="text-[11.5px] mt-1" style={{ color: COLORS.graphiteLight }}>ATM No {group.atmNo} · {group.date}</p>
+            <p className="text-[11.5px] mt-1" style={{ color: COLORS.graphiteLight }}>
+              ATM No {group.atmNo} · {group.date}
+              {shipped ? " · shipped & closed" : ""}
+            </p>
           </div>
-          <button type="button" className="btn-secondary p-2 rounded-lg shrink-0" style={{ border: `1px solid ${COLORS.border}`, color: COLORS.graphite }} onClick={onClose} aria-label="Close">
-            <CloseIcon />
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            {canWrite && !shipped && (
+              <button
+                type="button"
+                className="btn-secondary text-[11.5px] font-semibold px-3 py-2 rounded-lg"
+                style={{ border: `1px solid ${COLORS.border}`, color: COLORS.graphite }}
+                onClick={() => onEdit(group)}
+              >
+                Edit
+              </button>
+            )}
+            {canWrite && !shipped && (
+              <button
+                type="button"
+                className="btn-secondary text-[11.5px] font-semibold px-3 py-2 rounded-lg"
+                style={{ border: `1px solid ${COLORS.border}`, color: COLORS.rust, cursor: isDeleting ? "not-allowed" : "pointer", opacity: isDeleting ? 0.6 : 1 }}
+                onClick={() => onDelete(group)}
+                disabled={isDeleting}
+              >
+                {isDeleting ? "Deleting…" : "Delete"}
+              </button>
+            )}
+            <button type="button" className="btn-secondary p-2 rounded-lg shrink-0" style={{ border: `1px solid ${COLORS.border}`, color: COLORS.graphite }} onClick={onClose} aria-label="Close">
+              <CloseIcon />
+            </button>
+          </div>
         </div>
 
-        <div className="p-6">
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
-            <div className="rounded-xl p-4" style={{ background: COLORS.boneDim }}>
-              <div className="text-[10.5px] font-semibold uppercase tracking-wide" style={{ color: COLORS.graphite }}>Order lines</div>
-              <div className="text-[19px] font-semibold mt-1" style={{ color: COLORS.ink }}>{group.lines.length}</div>
-            </div>
-            <div className="rounded-xl p-4" style={{ background: COLORS.boneDim }}>
-              <div className="text-[10.5px] font-semibold uppercase tracking-wide" style={{ color: COLORS.graphite }}>Total sets</div>
-              <div className="text-[19px] font-semibold mt-1" style={{ color: COLORS.ink }}>{group.totalQuantity.toLocaleString()}</div>
-            </div>
-            <div className="rounded-xl p-4" style={{ background: COLORS.boneDim }}>
-              <div className="text-[10.5px] font-semibold uppercase tracking-wide" style={{ color: COLORS.graphite }}>Cartons ready</div>
-              <div className="text-[19px] font-semibold mt-1" style={{ color: COLORS.ink }}>{group.totalReadyCtns.toLocaleString()} / {group.totalReqdCtns.toLocaleString()}</div>
-            </div>
-            <div className="rounded-xl p-4" style={{ background: COLORS.goldSoft }}>
-              <div className="text-[10.5px] font-semibold uppercase tracking-wide" style={{ color: COLORS.goldDim }}>% against order</div>
-              <div className="text-[19px] font-semibold mt-1" style={{ color: COLORS.ink }}>{group.percent}%</div>
-            </div>
-          </div>
-
-          {group.notes && (
-            <div className="rounded-xl px-4 py-3 mb-4 text-[12px]" style={{ background: COLORS.goldSoft, color: COLORS.goldDim }}>
-              {group.notes}
-            </div>
-          )}
-
-          {/* Client Supplied Fabric & Yield Tracker */}
-          <div className="rounded-2xl p-4 mb-6" style={{ background: COLORS.boneDim, border: `1px solid ${COLORS.border}` }}>
-            <h4 className="text-[12px] font-semibold uppercase tracking-wider mb-2.5" style={{ color: COLORS.ink }}>Client Supplied Fabric Inventory &amp; Yield Efficiency</h4>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-[12px]">
-              <div>
-                <span className="text-[10px] uppercase font-semibold block" style={{ color: COLORS.graphite }}>Fabric Received</span>
-                <strong style={{ color: COLORS.ink }}>{(group.metersReceived || 5000).toLocaleString()} meters</strong>
-              </div>
-              <div>
-                <span className="text-[10px] uppercase font-semibold block" style={{ color: COLORS.graphite }}>Expected Yield</span>
-                <strong style={{ color: COLORS.ink }}>{(group.expectedYield || group.totalQuantity).toLocaleString()} pcs</strong>
-              </div>
-              <div>
-                <span className="text-[10px] uppercase font-semibold block" style={{ color: COLORS.graphite }}>Actual Dispatched</span>
-                <strong style={{ color: COLORS.ink }}>{group.totalReady.toLocaleString()} pcs</strong>
-              </div>
-              <div>
-                <span className="text-[10px] uppercase font-semibold block" style={{ color: COLORS.graphite }}>Fabric Wastage %</span>
-                <strong className="text-[13px]" style={{ color: COLORS.goldDim }}>
-                  {Math.max(0, (((group.expectedYield || group.totalQuantity) - group.totalReady) / (group.expectedYield || group.totalQuantity) * 100)).toFixed(1)}%
-                </strong>
-              </div>
-            </div>
-          </div>
-
-          <div className="flex flex-col gap-4">
-            {group.lines.map((line) => (
-              <div key={line.orderId} className="rounded-2xl overflow-hidden" style={{ border: `1px solid ${COLORS.border}` }}>
-                <div className="flex items-center justify-between flex-wrap gap-2 px-5 py-3" style={{ background: COLORS.boneDim }}>
-                  <div className="flex items-center gap-2.5 flex-wrap">
-                    <span className="text-[12px] font-bold px-2 py-1 rounded" style={{ background: COLORS.ink, color: COLORS.gold }}>#{line.orderId}</span>
-                    <span className="text-[12.5px] font-semibold" style={{ color: COLORS.ink }}>{line.article}</span>
-                    <span className="text-[11.5px]" style={{ color: COLORS.graphite }}>{line.size} · {line.dimensions}</span>
-                  </div>
-                  <StatusBadge status={statusOf(line.percent)} />
-                </div>
-
-                <div className="grid grid-cols-1 lg:grid-cols-5 gap-4 p-5">
-                  <div className="lg:col-span-2">
-                    <div className="text-[10.5px] font-semibold uppercase tracking-wide mb-2" style={{ color: COLORS.graphiteLight }}>Design / Color</div>
-                    <div className="flex flex-col gap-1.5">
-                      {line.colors.map((c, i) => (
-                        <div key={i} className="flex items-center justify-between text-[12px] px-2.5 py-1.5 rounded-lg" style={{ background: COLORS.bone }}>
-                          <span style={{ color: COLORS.ink }}>{c.design}</span>
-                          <span className="text-[10.5px]" style={{ color: COLORS.graphiteLight }}>
-                            {(c.readyQuantity || 0).toLocaleString()} / {c.quantity.toLocaleString()}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="lg:col-span-3">
-                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-                      <StatBlock label="Quantity" value={line.quantity.toLocaleString()} />
-                      <StatBlock label="Pack / CTN" value={line.packPerCtn} />
-                      <StatBlock label="Reqd CTNS" value={line.reqdCtns.toLocaleString()} />
-                      <StatBlock label="Ready Qty" value={line.readyQuantity.toLocaleString()} />
-                      <StatBlock label="Ready CTNS" value={line.readyCtns.toLocaleString()} />
-                      <StatBlock label="% Against order" value={`${line.percent}%`} highlight />
-                      <StatBlock label="Carton numbering" value={`1 to ${line.reqdCtns}`} />
-                      <StatBlock label="Net / Gross wt" value={`${line.netWeight} / ${line.grossWeight} kg`} />
-                      <StatBlock label="Carton size / CBM" value={`${line.cartonSize} · ${line.cbm}`} />
-                    </div>
-                    <div className="h-1.5 rounded-full overflow-hidden mt-4" style={{ background: COLORS.boneDim }}>
-                      <div className="h-1.5 rounded-full due-bar" style={{ width: `${line.percent}%`, background: statusColors(statusOf(line.percent)).fg }} />
-                    </div>
-                  </div>
-                </div>
-              </div>
+        <div className="px-6 pt-4">
+          <div
+            className="segmented inline-flex rounded-xl p-1 gap-1"
+            style={{ background: COLORS.boneDim }}
+            role="tablist"
+          >
+            {[
+              { id: "floor", label: "Floor" },
+              { id: "expenses", label: "Expenses" },
+            ].map((t) => (
+              <button
+                key={t.id}
+                type="button"
+                role="tab"
+                aria-selected={detailTab === t.id}
+                className="text-[12px] font-semibold px-4 py-1.5 rounded-lg"
+                style={{
+                  background: detailTab === t.id ? COLORS.inkSurface : "transparent",
+                  color: detailTab === t.id ? COLORS.gold : COLORS.graphite,
+                }}
+                onClick={() => setDetailTab(t.id)}
+              >
+                {t.label}
+              </button>
             ))}
           </div>
         </div>
 
-        {status === "Complete" && (
-          <div className="sticky bottom-0 flex items-center justify-between gap-3 px-6 py-4 flex-wrap" style={{ background: COLORS.card, borderTop: `1px solid ${COLORS.border}` }}>
-            <span className="text-[11.5px]" style={{ color: COLORS.graphiteLight }}>Every line is packed and ready — this order can be invoiced.</span>
-            <button
-              type="button"
-              className="btn-primary inline-flex items-center gap-1.5 text-[12.5px] font-semibold px-4 py-2 rounded-lg shrink-0"
-              style={{ background: COLORS.green, color: COLORS.card }}
-              onClick={() => onInvoice(group)}
-            >
-              <InvoiceIcon /> Create invoice
-            </button>
+        <div className="p-6">
+          {detailTab === "expenses" ? (
+            orderId ? (
+              <OrderAtmExpenses orderId={Number(orderId)} />
+            ) : (
+              <p className="text-[12.5px]" style={{ color: COLORS.graphite }}>
+                Order id missing — cannot load expenses.
+              </p>
+            )
+          ) : (
+            <>
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+                <div className="rounded-xl p-4" style={{ background: COLORS.boneDim }}>
+                  <div className="text-[10.5px] font-semibold uppercase tracking-wide" style={{ color: COLORS.graphite }}>Items</div>
+                  <div className="text-[19px] font-semibold mt-1" style={{ color: COLORS.ink }}>{displayItems.length}</div>
+                </div>
+                <div className="rounded-xl p-4" style={{ background: COLORS.boneDim }}>
+                  <div className="text-[10.5px] font-semibold uppercase tracking-wide" style={{ color: COLORS.graphite }}>Total sets</div>
+                  <div className="text-[19px] font-semibold mt-1" style={{ color: COLORS.ink }}>{group.totalQuantity.toLocaleString()}</div>
+                </div>
+                <div className="rounded-xl p-4" style={{ background: COLORS.boneDim }}>
+                  <div className="text-[10.5px] font-semibold uppercase tracking-wide" style={{ color: COLORS.graphite }}>Cartons ready</div>
+                  <div className="text-[19px] font-semibold mt-1" style={{ color: COLORS.ink }}>{group.totalReadyCtns.toLocaleString()} / {group.totalReqdCtns.toLocaleString()}</div>
+                </div>
+                <div className="rounded-xl p-4" style={{ background: COLORS.goldSoft }}>
+                  <div className="text-[10.5px] font-semibold uppercase tracking-wide" style={{ color: COLORS.goldDim }}>% against order</div>
+                  <div className="text-[19px] font-semibold mt-1" style={{ color: COLORS.ink }}>{group.percent}%</div>
+                </div>
+              </div>
+
+              {group.notes && (
+                <div className="rounded-xl px-4 py-3 mb-4 text-[12px]" style={{ background: COLORS.goldSoft, color: COLORS.goldDim }}>
+                  {group.notes}
+                </div>
+              )}
+
+              <div className="flex flex-col gap-4">
+                {displayItems.map((item, idx) =>
+                  item.type === "set" ? (
+                    <SetOrderGroupCard
+                      key={item.key}
+                      item={item}
+                      index={idx + 1}
+                      stationTotals={stationTotals}
+                      addonTotals={addonTotals}
+                    />
+                  ) : (
+                    <ArticleLineCard
+                      key={item.key}
+                      line={item.line}
+                      stationTotals={stationTotals}
+                      addonTotals={addonTotals}
+                    />
+                  )
+                )}
+              </div>
+            </>
+          )}
+        </div>
+
+        {shipped ? (
+          <div className="sticky bottom-0 flex items-center justify-between gap-3 px-6 py-4 flex-wrap" style={{ background: COLORS.ink, borderTop: `1px solid ${COLORS.border}` }}>
+            <span className="text-[11.5px]" style={{ color: COLORS.graphiteLight }}>
+              Fully shipped and closed. Partial leftovers stay on this ATM until shipped.
+            </span>
+            <span className="text-[12.5px] font-semibold" style={{ color: COLORS.gold }}>
+              Order closed
+            </span>
           </div>
-        )}
+        ) : isAwaitingShipment(group) ? (
+          <div className="sticky bottom-0 flex items-center justify-between gap-3 px-6 py-4 flex-wrap" style={{ background: COLORS.card, borderTop: `1px solid ${COLORS.border}` }}>
+            <span className="text-[11.5px]" style={{ color: COLORS.graphiteLight }}>
+              Packing is at 100%+. Open Shipment to ship (full or partial) — invoice and security are created there.
+            </span>
+            <Link
+              to="/shipment"
+              className="btn-primary inline-flex items-center gap-1.5 text-[12.5px] font-semibold px-4 py-2 rounded-lg shrink-0 no-underline"
+              style={{ background: COLORS.gold, color: COLORS.ink }}
+            >
+              Go to Shipment
+            </Link>
+          </div>
+        ) : statusOf(group.percent) === "Complete" ? (
+          <div className="sticky bottom-0 flex items-center justify-between gap-3 px-6 py-4 flex-wrap" style={{ background: COLORS.card, borderTop: `1px solid ${COLORS.border}` }}>
+            <span className="text-[11.5px]" style={{ color: COLORS.graphiteLight }}>
+              Packing complete — status will move to Waiting for Shipment automatically.
+            </span>
+          </div>
+        ) : null}
       </div>
     </div>
   );
@@ -443,21 +940,71 @@ function StatBlock({ label, value, highlight }) {
   );
 }
 
-function buildInvoiceRows(group) {
-  const rows = [];
-  group.lines.forEach((line) => {
-    if (line.colors.length) {
-      line.colors.forEach((c) => {
-        rows.push({ description: `${line.article} (${line.size})`, design: c.design, qty: c.quantity, rate: "" });
-      });
-    } else {
-      rows.push({ description: `${line.article} (${line.size})`, design: "—", qty: line.quantity, rate: "" });
-    }
-  });
-  return rows;
+function uniqueDesignNames(colors, metaDesignColors) {
+  const names = [];
+  const seen = new Set();
+  const push = (name) => {
+    const n = String(name || "").trim() || "—";
+    if (seen.has(n)) return;
+    seen.add(n);
+    names.push(n);
+  };
+  (metaDesignColors || []).forEach((d) => push(d?.name || d));
+  (colors || []).forEach((c) => push(c.design));
+  return names.length ? names : ["—"];
 }
 
-function InvoiceModal({ group, billNo, onClose }) {
+function rateFromMeta(meta) {
+  if (!meta) return "";
+  const candidates = [meta.orderPriceOverride, meta.setSellingPerUnit, meta.suggestedSellingPerUnit];
+  for (const c of candidates) {
+    if (c != null && c !== "" && !Number.isNaN(Number(c))) return String(Math.round(Number(c)));
+  }
+  return "";
+}
+
+/** One row per set (or article). Rate from order; qty = ordered; also tracks made. */
+function buildInvoiceRows(group) {
+  const lines = (group.lines || []).map((l) => (l.percent != null ? l : calcLine(l)));
+  const items = group.displayItems || groupLinesForDisplay(lines);
+  return items.map((item) => {
+    if (item.type === "set") {
+      const meta = item.lines[0]?.setMeta;
+      const designLines = uniqueDesignNames(
+        item.lines.flatMap((l) => l.colors || []),
+        meta?.designColors
+      );
+      const qtyOrdered = Number(item.setQuantity) || 0;
+      const qtyMade = Number(item.readySets) || 0;
+      return {
+        description: item.configurationName
+          ? `${item.setName} · ${item.configurationName}`
+          : item.setName,
+        design: designLines.join("\n"),
+        designLines,
+        qty: String(qtyOrdered),
+        qtyOrdered,
+        qtyMade,
+        rate: rateFromMeta({ ...meta, setSellingPerUnit: item.setSellingPerUnit ?? meta?.setSellingPerUnit }),
+      };
+    }
+    const line = item.line;
+    const designLines = uniqueDesignNames(line.colors, line.setMeta?.designColors);
+    const qtyOrdered = Number(line.quantity) || 0;
+    const qtyMade = Number(line.readyQuantity) || 0;
+    return {
+      description: `${line.article}${line.size && line.size !== "—" ? ` (${line.size})` : ""}`,
+      design: designLines.join("\n"),
+      designLines,
+      qty: String(qtyOrdered),
+      qtyOrdered,
+      qtyMade,
+      rate: rateFromMeta(line.setMeta),
+    };
+  });
+}
+
+function InvoiceModal({ group, billNo, onClose, onInvoiced }) {
   const [rows, setRows] = useState(() => buildInvoiceRows(group));
   const [name, setName] = useState(group.customer);
   const [orderRef, setOrderRef] = useState(`ATM ${group.atmNo}`);
@@ -468,6 +1015,10 @@ function InvoiceModal({ group, billNo, onClose }) {
   const [scNo, setScNo] = useState("");
   const [isExporting, setIsExporting] = useState(false);
   const [isPrinting, setIsPrinting] = useState(false);
+
+  useEffect(() => {
+    setRows(buildInvoiceRows(group));
+  }, [group]);
 
   useEffect(() => {
     const onKey = (e) => e.key === "Escape" && onClose();
@@ -483,7 +1034,10 @@ function InvoiceModal({ group, billNo, onClose }) {
     setRows((r) => r.map((row, idx) => (idx === i ? { ...row, [field]: value } : row)));
   }
 
-  const subTotal = rows.reduce((s, r) => s + (Number(r.qty) || 0) * (Number(r.rate) || 0), 0);
+  const subTotal = rows.reduce(
+    (s, r) => s + (Number(r.qtyOrdered ?? r.qty ?? 0) || 0) * (Number(r.rate) || 0),
+    0
+  );
 
   function buildInvoiceElement() {
     return (
@@ -516,6 +1070,7 @@ function InvoiceModal({ group, billNo, onClose }) {
       link.click();
       link.remove();
       URL.revokeObjectURL(url);
+      onInvoiced?.(group);
     } catch (err) {
       console.error("PDF export failed:", err);
       window.alert("Couldn't generate the PDF. Check the console for details.");
@@ -554,6 +1109,7 @@ function InvoiceModal({ group, billNo, onClose }) {
           window.open(url, "_blank");
         }
         setTimeout(cleanup, 60000);
+        onInvoiced?.(group);
       };
 
       document.body.appendChild(iframe);
@@ -577,7 +1133,9 @@ function InvoiceModal({ group, billNo, onClose }) {
         <div className="no-print flex items-center justify-between gap-3 px-6 py-4 sticky top-0 z-10" style={{ background: COLORS.card, borderBottom: `1px solid ${COLORS.border}` }}>
           <div>
             <h2 className="text-[15px] font-semibold" style={{ color: COLORS.ink }}>Invoice preview</h2>
-            <p className="text-[11px] mt-0.5" style={{ color: COLORS.graphiteLight }}>Fill in rates, then download or print — no printer needed to check the layout</p>
+            <p className="text-[11px] mt-0.5" style={{ color: COLORS.graphiteLight }}>
+              Rates from order · sets as one row · download or print moves order to waiting for payment
+            </p>
           </div>
           <div className="flex items-center gap-2 shrink-0">
             <button
@@ -661,15 +1219,21 @@ function InvoiceModal({ group, billNo, onClose }) {
                   <tr key={i}>
                     <td className="text-center px-2 py-1.5" style={{ border: "1px solid #000", color: "#000" }}>{i + 1}</td>
                     <td className="px-1 py-1" style={{ border: "1px solid #000", color: "#000" }}>{row.description}</td>
-                    <td className="px-1 py-1" style={{ border: "1px solid #000", color: "#000" }}>{row.design}</td>
-                    <td className="px-1 py-1" style={{ border: "1px solid #000", color: "#000" }}>
-                      <input className="invoice-cell-input text-right" value={row.qty} onChange={(e) => updateRow(i, "qty", e.target.value)} />
+                    <td className="px-1 py-1 whitespace-pre-line" style={{ border: "1px solid #000", color: "#000" }}>
+                      {(row.designLines || String(row.design || "").split("\n")).join("\n")}
+                    </td>
+                    <td className="px-2 py-1.5 text-right" style={{ border: "1px solid #000", color: "#000" }}>
+                      <div className="font-medium">{Number(row.qtyOrdered ?? row.qty ?? 0).toLocaleString()}</div>
+                      <div className="text-[10px]" style={{ color: "#444" }}>
+                        Order {Number(row.qtyOrdered ?? row.qty ?? 0).toLocaleString()}
+                        {" · "}Made {Number(row.qtyMade || 0).toLocaleString()}
+                      </div>
                     </td>
                     <td className="px-1 py-1" style={{ border: "1px solid #000", color: "#000" }}>
                       <input className="invoice-cell-input text-right" placeholder="0" value={row.rate} onChange={(e) => updateRow(i, "rate", e.target.value)} />
                     </td>
                     <td className="text-right px-3 py-1.5 font-medium" style={{ border: "1px solid #000", color: "#000" }}>
-                      {((Number(row.qty) || 0) * (Number(row.rate) || 0)).toLocaleString()}
+                      {((Number(row.qtyOrdered ?? row.qty ?? 0)) * (Number(row.rate) || 0)).toLocaleString()}
                     </td>
                   </tr>
                 ))}
@@ -698,7 +1262,7 @@ function InvoiceModal({ group, billNo, onClose }) {
         </div>
 
         <div className="no-print px-6 pb-5 text-[11px]" style={{ color: COLORS.graphiteLight }}>
-          Once your backend is connected, printing this can automatically move the order off the active list and into an Invoices page.
+          Creating an invoice keeps the order and moves it to Waiting for Shipment. You can recreate the invoice anytime.
         </div>
       </div>
     </div>
@@ -723,32 +1287,146 @@ function emptyLine() {
     articleId: null,
     sizeId: null,
     dimensionId: null,
+    sizeText: "",
+    orderPriceOverride: "",
     packPerCtn: 6,
     quantity: "",
     netWeight: "",
     grossWeight: "",
     cartonSize: "",
     cbm: "",
-    splitMode: "equal", // "equal" | "custom"
-    selectedVariantIds: [], // article_variants chosen as designs/colors for this line
-    variantMeta: {}, // variantId -> { quantity: '', barcode: '' } (quantity used only in custom mode)
+    departments: { ...DEFAULT_DEPARTMENTS },
+    splitMode: "equal",
+    designColors: [],
+    addonIds: [],
   };
+}
+
+function snapshotAddonsForArticle(article, addonIds) {
+  const ids = Array.isArray(addonIds) ? addonIds : [];
+  return (article?.addons || [])
+    .filter((a) => ids.includes(a.addon_id || a.id))
+    .map((a) => ({
+      id: a.addon_id || a.id,
+      name: a.addon_name || a.name,
+      addonRate: Number(a.addon_rate ?? a.addonRate) || 0,
+      requiresStations: a.requires_stations || a.requiresStations || ["Cutting", "Stitching"],
+      afterStation: a.after_station || a.afterStation || "Checking",
+      sellingPrice: a.extra_selling_price ?? a.sellingPrice ?? null,
+    }));
+}
+
+function departmentsFromApiLine(l) {
+  const meta = l.set_order_meta || l.set_meta;
+  if (meta?.departments) return { ...DEFAULT_DEPARTMENTS, ...meta.departments };
+  return {
+    cutting: !l.skip_cutting,
+    stitching: !l.skip_stitching,
+    checking: !l.skip_checking,
+    packing: !l.skip_packing,
+  };
+}
+
+function skipsFromDepartments(departments) {
+  const d = { ...DEFAULT_DEPARTMENTS, ...(departments || {}) };
+  return {
+    skip_cutting: !d.cutting,
+    skip_stitching: !d.stitching,
+    skip_checking: !d.checking,
+    skip_packing: !d.packing,
+  };
+}
+
+/** Rebuild set-builder blocks from saved set order lines (for edit). */
+function setBlocksFromOrder(order, sets) {
+  const setLines = (order?.lines || []).filter((l) => (l.set_order_meta || l.set_meta)?.setId);
+  if (!setLines.length) return [];
+
+  const groups = new Map();
+  for (const line of setLines) {
+    const meta = line.set_order_meta || line.set_meta;
+    const setQty =
+      meta.orderQuantity != null && meta.orderQuantity !== ""
+        ? Number(meta.orderQuantity)
+        : meta.quantityPerSet
+          ? Math.round(line.quantity / (Number(meta.quantityPerSet) || 1))
+          : line.quantity;
+    const designs = (meta.designColors || []).map((d) => d.name || "").join("|");
+    const key =
+      meta.groupId ||
+      `${meta.setId}::${meta.configurationId || ""}::${line.pack_per_ctn}::${setQty}::${designs}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(line);
+  }
+
+  return [...groups.entries()].map(([key, groupLines]) => {
+    const first = groupLines[0];
+    const meta = first.set_order_meta || first.set_meta || {};
+    const qps = Number(meta.quantityPerSet) || 1;
+    const setQty =
+      meta.orderQuantity != null && meta.orderQuantity !== ""
+        ? Number(meta.orderQuantity)
+        : Math.round(first.quantity / qps);
+
+    const fromVar = designColorsFromVariants(first.variants || []);
+    const splitMode = meta.splitMode || fromVar.splitMode || "equal";
+    let designColors = [];
+    if ((meta.designColors || []).length) {
+      designColors = meta.designColors.map((dc) => {
+        const match = fromVar.designColors.find((v) => v.id === dc.id || v.name === dc.name);
+        const pieceQty = match ? Number(match.quantity) || 0 : 0;
+        const namedCount = (meta.designColors || []).filter((d) => d.name?.trim()).length;
+        return {
+          id: dc.id || match?.id || emptyDesignColor().id,
+          name: dc.name || "",
+          barcode: dc.barcode || match?.barcode || "",
+          quantity:
+            splitMode === "custom" && namedCount > 1
+              ? String(Math.round(pieceQty / qps) || "")
+              : dc.quantity != null && dc.quantity !== ""
+                ? String(dc.quantity)
+                : "",
+        };
+      });
+    } else {
+      designColors = fromVar.designColors.map((dc) => ({
+        ...dc,
+        quantity: String(Math.round((Number(dc.quantity) || 0) / qps) || ""),
+      }));
+    }
+
+    const override = meta.orderPriceOverride;
+
+    return {
+      key: meta.groupId || key,
+      setId: meta.setId || "",
+      sizeText: meta.sizeText || meta.configurationName || first.dimension_name || "",
+      orderQuantity: setQty || 1,
+      packPerCtn: first.pack_per_ctn || 6,
+      orderPriceOverride: override != null && override !== "" ? String(override) : "",
+      splitMode,
+      designColors,
+      departments: departmentsFromApiLine(first),
+      parts: groupLines.map((l) => {
+        const m = l.set_order_meta || l.set_meta || {};
+        const setArticleId =
+          m.setArticleId ||
+          (String(l.article_id).includes(":") ? String(l.article_id).split(":").slice(1).join(":") : "");
+        return {
+          setArticleId,
+          quantityPerSet: Number(m.quantityPerSet) || 1,
+          addonIds: [...(m.addonIds || [])],
+          sizeNote: m.sizeNote || "",
+        };
+      }),
+      expanded: true,
+    };
+  });
 }
 function emptyDraft() {
   return { atmNo: "", customer: "", date: "", lines: [emptyLine()] };
 }
 
-// Splits `quantity` across `ids` as evenly as possible — remainder pieces go
-// to the first few designs so the numbers always add up exactly.
-function equalSplit(quantity, ids) {
-  const n = ids.length;
-  if (!n) return {};
-  const base = Math.floor(quantity / n);
-  const remainder = quantity - base * n;
-  const out = {};
-  ids.forEach((id, i) => { out[id] = base + (i < remainder ? 1 : 0); });
-  return out;
-}
 
 function PartialOrderModal({ group, onClose, onConfirmSplit, isSaving, error }) {
   const totalQty = group.totalQuantity;
@@ -816,19 +1494,152 @@ function todayISO() {
   return new Date().toISOString().split("T")[0];
 }
 
-// Null when the line's design/color split is fine (or not applicable);
-// otherwise a short message describing why it doesn't add up yet.
 function lineSplitError(line) {
-  if (!line.selectedVariantIds.length) return null;
-  if (line.splitMode !== "custom") return null; // equal split always sums exactly by construction
-  const qty = Number(line.quantity) || 0;
-  const sum = line.selectedVariantIds.reduce((s, id) => s + (Number(line.variantMeta[id]?.quantity) || 0), 0);
-  if (sum !== qty) return `Split adds up to ${sum.toLocaleString()}, needs to equal ${qty.toLocaleString()}`;
-  return null;
+  return designColorSplitError(line.designColors, line.splitMode, line.quantity);
 }
 
-function AddOrderModal({ articles, onClose, onSave, isSaving, error }) {
-  const [draft, setDraft] = useState(() => ({ ...emptyDraft(), date: todayISO() }));
+function buildVariantsFromLine(line) {
+  return buildVariantsFromDesignColors(line.designColors, line.splitMode, line.quantity);
+}
+
+function draftFromOrder(order) {
+  // Set parts belong in the Set order tab — only keep standalone article lines here
+  const articleLines = (order.lines || [])
+    .filter((l) => !(l.set_order_meta || l.set_meta)?.setId)
+    .map((l) => {
+      const { designColors, splitMode } = designColorsFromVariants(l.variants);
+      const meta = l.set_order_meta || l.set_meta || {};
+      return {
+        articleId: l.article_id,
+        sizeId: l.size_id,
+        dimensionId: null,
+        sizeText: meta.sizeText || l.dimension_name || "",
+        orderPriceOverride:
+          meta.orderPriceOverride != null && meta.orderPriceOverride !== ""
+            ? String(meta.orderPriceOverride)
+            : "",
+        packPerCtn: l.pack_per_ctn,
+        quantity: String(l.quantity),
+        netWeight: l.net_weight == null ? "" : String(l.net_weight),
+        grossWeight: l.gross_weight == null ? "" : String(l.gross_weight),
+        cartonSize: l.carton_size || "",
+        cbm: l.cbm == null ? "" : String(l.cbm),
+        departments: departmentsFromApiLine(l),
+        splitMode,
+        designColors,
+        addonIds: Array.isArray(meta.addonIds)
+          ? [...meta.addonIds]
+          : Array.isArray(meta.addons)
+            ? meta.addons.map((a) => a.id)
+            : [],
+        cutting_rate: l.cutting_rate,
+        stitching_rate: l.stitching_rate,
+        checking_rate: l.checking_rate,
+        packing_rate: l.packing_rate,
+        articleLabel: l.article_name,
+        dimensionLabel: meta.sizeText || l.dimension_name,
+      };
+    });
+
+  return {
+    atmNo: order.atm_no,
+    customer: order.customer,
+    date: order.order_date ? String(order.order_date).slice(0, 10) : todayISO(),
+    lines: articleLines.length ? articleLines : [emptyLine()],
+  };
+}
+
+function setPayloadsToDraftLines(payloads) {
+  return (payloads || []).flatMap(({ set, setOrder }) => {
+    if (!set || !setOrder) return [];
+    const flattened = flattenSetOrderToLines(set, setOrder, setOrder.packPerCtn || 6);
+    const departments = { ...DEFAULT_DEPARTMENTS, ...(setOrder.departments || {}) };
+    return flattened.map((line) => {
+      const { designColors, splitMode } = designColorsFromVariants(line.variants);
+      return {
+        articleId: line.article_id,
+        sizeId: null,
+        dimensionId: line.dimension_id,
+        packPerCtn: line.pack_per_ctn,
+        quantity: String(line.quantity),
+        netWeight: line.net_weight != null ? String(line.net_weight) : "",
+        grossWeight: line.gross_weight != null ? String(line.gross_weight) : "",
+        cartonSize: line.carton_size || "",
+        cbm: line.cbm != null ? String(line.cbm) : "",
+        departments,
+        splitMode,
+        designColors,
+        cutting_rate: line.cutting_rate,
+        stitching_rate: line.stitching_rate,
+        checking_rate: line.checking_rate,
+        packing_rate: line.packing_rate,
+        setOrderMeta: line.set_order_meta,
+        articleLabel: line.article_name,
+        dimensionLabel: line.dimension_name,
+      };
+    });
+  });
+}
+
+function draftLineToApiLine(l, articles) {
+  const qty = Number(l.quantity) || 0;
+  const skips = skipsFromDepartments(l.departments);
+  const article = articles.find((a) => a.article_id === l.articleId) || null;
+  const addonIds = Array.isArray(l.addonIds) ? l.addonIds : [];
+  const addonSnapshots = snapshotAddonsForArticle(article, addonIds);
+  const sizeText = (l.sizeText || l.dimensionLabel || "").trim();
+  const orderPriceOverride =
+    l.orderPriceOverride !== "" && l.orderPriceOverride != null
+      ? Number(l.orderPriceOverride) || 0
+      : null;
+
+  // Set lines keep full set meta; standalone articles store size + price + add-ons
+  let set_order_meta = null;
+  if (l.setOrderMeta) {
+    set_order_meta = {
+      ...l.setOrderMeta,
+      departments: { ...DEFAULT_DEPARTMENTS, ...(l.departments || l.setOrderMeta.departments || {}) },
+    };
+  } else {
+    set_order_meta = {
+      addonIds,
+      addons: addonSnapshots,
+      departments: { ...DEFAULT_DEPARTMENTS, ...(l.departments || {}) },
+      ...(sizeText ? { sizeText } : {}),
+      ...(orderPriceOverride != null ? { orderPriceOverride } : {}),
+    };
+  }
+
+  return {
+    article_id: l.articleId,
+    article_name: l.articleLabel || article?.article_name || String(l.articleId),
+    size_id: null,
+    size_name: null,
+    dimension_id: null,
+    dimension_name: sizeText || null,
+    quantity: qty,
+    pack_per_ctn: Number(l.packPerCtn) || 1,
+    net_weight: l.netWeight === "" ? null : Number(l.netWeight),
+    gross_weight: l.grossWeight === "" ? null : Number(l.grossWeight),
+    carton_size: l.cartonSize.trim() || null,
+    cbm: l.cbm === "" ? null : Number(l.cbm),
+    ...skips,
+    cutting_rate: l.cutting_rate,
+    stitching_rate: l.stitching_rate,
+    checking_rate: l.checking_rate,
+    packing_rate: l.packing_rate,
+    variants: buildVariantsFromLine(l),
+    set_order_meta,
+  };
+}
+
+function AddOrderModal({ articles, sets, editingOrder, onClose, onSave, isSaving, error }) {
+  const initialSetBlocks = editingOrder ? setBlocksFromOrder(editingOrder, sets) : undefined;
+  const [draft, setDraft] = useState(() => (editingOrder ? draftFromOrder(editingOrder) : { ...emptyDraft(), date: todayISO() }));
+  const [showSetBuilder, setShowSetBuilder] = useState(() =>
+    editingOrder ? initialSetBlocks.length > 0 : true
+  );
+  const [setDraftState, setSetDraftState] = useState({ canApply: false, payloads: [], grandTotal: 0, error: null });
 
   useEffect(() => {
     const onKey = (e) => e.key === "Escape" && onClose();
@@ -847,74 +1658,82 @@ function AddOrderModal({ articles, onClose, onSave, isSaving, error }) {
     setDraft((d) => ({ ...d, lines: d.lines.map((l, i) => (i === idx ? { ...l, [field]: value } : l)) }));
   }
   function setLineArticle(idx, articleId) {
-    // Size/dimension/design choices are all specific to the article, so
-    // switching articles clears them rather than leaving stale ids around.
+    // Add-ons opt-in: only appear in Daily Entry when checked on this order line
     setDraft((d) => ({
       ...d,
-      lines: d.lines.map((l, i) => (i !== idx ? l : { ...l, articleId, sizeId: null, dimensionId: null, selectedVariantIds: [], variantMeta: {} })),
+      lines: d.lines.map((l, i) =>
+        i !== idx
+          ? l
+          : {
+              ...l,
+              articleId,
+              dimensionId: null,
+              sizeText: "",
+              orderPriceOverride: "",
+              designColors: [],
+              splitMode: "equal",
+              addonIds: [],
+            }
+      ),
     }));
   }
+
   function addLine() {
     setDraft((d) => ({ ...d, lines: [...d.lines, emptyLine()] }));
   }
   function removeLine(idx) {
     setDraft((d) => ({ ...d, lines: d.lines.filter((_, i) => i !== idx) }));
   }
-  function toggleVariant(lineIdx, variantId) {
+  function addDesignColor(lineIdx) {
     setDraft((d) => ({
       ...d,
-      lines: d.lines.map((l, i) => {
-        if (i !== lineIdx) return l;
-        const selected = l.selectedVariantIds.includes(variantId);
-        const selectedVariantIds = selected ? l.selectedVariantIds.filter((id) => id !== variantId) : [...l.selectedVariantIds, variantId];
-        const variantMeta = { ...l.variantMeta };
-        if (!selected && !variantMeta[variantId]) variantMeta[variantId] = { quantity: "", barcode: "" };
-        return { ...l, selectedVariantIds, variantMeta };
-      }),
+      lines: d.lines.map((l, i) => (i !== lineIdx ? l : { ...l, designColors: [...(l.designColors || []), emptyDesignColor()] })),
+    }));
+  }
+  function updateDesignColor(lineIdx, dcId, field, value) {
+    setDraft((d) => ({
+      ...d,
+      lines: d.lines.map((l, i) => (i !== lineIdx ? l : {
+        ...l,
+        designColors: (l.designColors || []).map((dc) => (dc.id === dcId ? { ...dc, [field]: value } : dc)),
+      })),
+    }));
+  }
+  function removeDesignColor(lineIdx, dcId) {
+    setDraft((d) => ({
+      ...d,
+      lines: d.lines.map((l, i) => (i !== lineIdx ? l : { ...l, designColors: (l.designColors || []).filter((dc) => dc.id !== dcId) })),
     }));
   }
   function setSplitMode(lineIdx, mode) {
     setLineField(lineIdx, "splitMode", mode);
   }
-  function setVariantMeta(lineIdx, variantId, field, value) {
-    setDraft((d) => ({
-      ...d,
-      lines: d.lines.map((l, i) =>
-        i !== lineIdx ? l : { ...l, variantMeta: { ...l.variantMeta, [variantId]: { ...l.variantMeta[variantId], [field]: value } } }
-      ),
-    }));
-  }
 
+  const articleLinesReady = draft.lines.some((l) => {
+    if (!(l.articleId && Number(l.quantity) > 0)) return false;
+    const d = { ...DEFAULT_DEPARTMENTS, ...(l.departments || {}) };
+    return d.cutting || d.stitching || d.checking || d.packing;
+  });
+  const articleSplitsOk = draft.lines.every((l) => !(l.articleId && Number(l.quantity) > 0) || !lineSplitError(l));
+  const setLinesReady = Boolean(setDraftState.canApply && setDraftState.payloads.length);
   const isValid =
-    draft.atmNo.trim() &&
-    draft.customer.trim() &&
-    draft.lines.some((l) => l.articleId && Number(l.quantity) > 0) &&
-    draft.lines.every((l) => !(l.articleId && Number(l.quantity) > 0) || !lineSplitError(l));
+    Boolean(draft.atmNo.trim() && draft.customer.trim()) &&
+    (articleLinesReady || setLinesReady) &&
+    articleSplitsOk;
 
   function handleSubmit() {
     if (!isValid || isSaving) return;
-    const cleanLines = draft.lines
+
+    const fromArticles = draft.lines
       .filter((l) => l.articleId && Number(l.quantity) > 0)
-      .map((l) => {
-        const qty = Number(l.quantity) || 0;
-        const split = l.splitMode === "equal" ? equalSplit(qty, l.selectedVariantIds) : null;
-        return {
-          article_id: l.articleId,
-          size_id: l.sizeId || null,
-          dimension_id: l.dimensionId || null,
-          quantity: qty,
-          pack_per_ctn: Number(l.packPerCtn) || 1,
-          net_weight: l.netWeight === "" ? null : Number(l.netWeight),
-          gross_weight: l.grossWeight === "" ? null : Number(l.grossWeight),
-          carton_size: l.cartonSize.trim() || null,
-          cbm: l.cbm === "" ? null : Number(l.cbm),
-          variants: l.selectedVariantIds.map((id) => ({
-            variant_id: id,
-            barcode: l.variantMeta[id]?.barcode?.trim() || null,
-            quantity: l.splitMode === "equal" ? split[id] : Number(l.variantMeta[id]?.quantity) || 0,
-          })),
-        };
-      });
+      .map((l) => draftLineToApiLine(l, articles));
+
+    const fromSets = setLinesReady
+      ? setPayloadsToDraftLines(setDraftState.payloads).map((l) => draftLineToApiLine(l, articles))
+      : [];
+
+    const cleanLines = [...fromArticles, ...fromSets];
+    if (!cleanLines.length) return;
 
     onSave({
       atm_no: draft.atmNo.trim(),
@@ -936,8 +1755,12 @@ function AddOrderModal({ articles, onClose, onSave, isSaving, error }) {
       >
         <div className="flex items-start justify-between gap-3 px-6 py-5 sticky top-0 z-10" style={{ background: COLORS.card, borderBottom: `1px solid ${COLORS.border}` }}>
           <div>
-            <h2 className="text-[16px] font-semibold" style={{ color: COLORS.ink }}>New order</h2>
-            <p className="text-[11.5px] mt-0.5" style={{ color: COLORS.graphiteLight }}>Add an ATM order with one or more order lines, pulled straight from your articles</p>
+            <h2 className="text-[16px] font-semibold" style={{ color: COLORS.ink }}>{editingOrder ? "Edit order" : "New order"}</h2>
+            <p className="text-[11.5px] mt-0.5" style={{ color: COLORS.graphiteLight }}>
+              {editingOrder
+                ? `Editing ATM ${editingOrder.atm_no} · ${editingOrder.customer}`
+                : "Article lines, set order, or both — then Add order"}
+            </p>
           </div>
           <button type="button" className="btn-secondary p-2 rounded-lg shrink-0" style={{ border: `1px solid ${COLORS.border}`, color: COLORS.graphite }} onClick={onClose} aria-label="Close">
             <CloseIcon />
@@ -964,13 +1787,37 @@ function AddOrderModal({ articles, onClose, onSave, isSaving, error }) {
             </div>
           </div>
 
+          <div className="flex flex-wrap gap-2 mb-5">
+            <button type="button" className="text-[12px] px-3.5 py-2 rounded-lg font-semibold" style={{ background: !showSetBuilder ? COLORS.gold : COLORS.card, color: COLORS.ink, border: `1px solid ${COLORS.border}` }} onClick={() => setShowSetBuilder(false)}>
+              Article lines{articleLinesReady ? ` · ${draft.lines.filter((l) => l.articleId && Number(l.quantity) > 0).length}` : ""}
+            </button>
+            <button type="button" className="text-[12px] px-3.5 py-2 rounded-lg font-semibold" style={{ background: showSetBuilder ? COLORS.gold : COLORS.card, color: COLORS.ink, border: `1px solid ${COLORS.border}` }} onClick={() => setShowSetBuilder(true)}>
+              Set order{setLinesReady ? ` · ${setDraftState.payloads.length}` : ""}
+            </button>
+          </div>
+
+          <div style={{ display: showSetBuilder ? "block" : "none" }}>
+            <SetOrderBuilder
+              sets={sets}
+              onDraftChange={setSetDraftState}
+              initialBlocks={initialSetBlocks}
+            />
+          </div>
+
+          <div style={{ display: showSetBuilder ? "none" : "block" }}>
           <div className="flex flex-col gap-4">
             {draft.lines.map((line, lineIdx) => {
-              const article = articles.find((a) => a.article_id === line.articleId) || null;
+              const article =
+                articles.find((a) => a.article_id === line.articleId)
+                || articles.find((a) => a.article_id === `ART-${line.articleId}`)
+                || articles.find((a) => String(a.article_id).replace(/^ART-/, "") === String(line.articleId || "").replace(/^ART-/, ""))
+                || null;
               const qty = Number(line.quantity) || 0;
+              const designColors = line.designColors || [];
+              const namedEntries = designColors.filter((dc) => dc.name?.trim());
               const splitError = lineSplitError(line);
-              const equalPreview = line.splitMode === "equal" ? equalSplit(qty, line.selectedVariantIds) : null;
-              const customSum = line.selectedVariantIds.reduce((s, id) => s + (Number(line.variantMeta[id]?.quantity) || 0), 0);
+              const equalPreview = line.splitMode === "equal" && namedEntries.length > 1 ? equalSplit(qty, namedEntries.map((dc) => dc.id)) : null;
+              const customSum = namedEntries.reduce((s, dc) => s + (Number(dc.quantity) || 0), 0);
 
               return (
                 <div key={lineIdx} className="line-card rounded-2xl p-4" style={{ border: `1.5px dashed ${COLORS.boneBorder}`, background: COLORS.bone }}>
@@ -983,11 +1830,11 @@ function AddOrderModal({ articles, onClose, onSave, isSaving, error }) {
                     )}
                   </div>
 
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-3">
                     <div className="sm:col-span-2">
                       <label className="form-label">Article</label>
                       <div className="select-wrap w-full">
-                        <select className="w-full" value={line.articleId ?? ""} onChange={(e) => setLineArticle(lineIdx, e.target.value ? Number(e.target.value) : null)}>
+                        <select className="w-full" value={line.articleId ?? ""} onChange={(e) => setLineArticle(lineIdx, e.target.value || null)}>
                           <option value="">Select article…</option>
                           {articles.map((a) => (
                             <option key={a.article_id} value={a.article_id}>{a.article_name}</option>
@@ -997,46 +1844,22 @@ function AddOrderModal({ articles, onClose, onSave, isSaving, error }) {
                           <path d="M2.5 4.5L6 8l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
                         </svg>
                       </div>
+                      {line.articleLabel && line.articleLabel !== articles.find((a) => a.article_id === line.articleId)?.article_name && (
+                        <p className="text-[10.5px] mt-1" style={{ color: COLORS.goldDim }}>{line.articleLabel}</p>
+                      )}
                     </div>
                     <div>
                       <label className="form-label">Size</label>
-                      {article?.sizes?.length > 0 ? (
-                        <div className="select-wrap w-full">
-                          <select className="w-full" value={line.sizeId ?? ""} onChange={(e) => setLineField(lineIdx, "sizeId", e.target.value ? Number(e.target.value) : null)}>
-                            <option value="">No size</option>
-                            {article.sizes.map((s) => (
-                              <option key={s.size_id} value={s.size_id}>{s.size_name}</option>
-                            ))}
-                          </select>
-                          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="select-caret">
-                            <path d="M2.5 4.5L6 8l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-                          </svg>
-                        </div>
-                      ) : (
-                        <div className="form-input" style={{ color: COLORS.graphiteLight, background: COLORS.boneDim }}>{article ? "No sizes" : "—"}</div>
-                      )}
-                    </div>
-                    <div>
-                      <label className="form-label">Dimensions</label>
-                      {article?.dimensions?.length > 0 ? (
-                        <div className="select-wrap w-full">
-                          <select className="w-full" value={line.dimensionId ?? ""} onChange={(e) => setLineField(lineIdx, "dimensionId", e.target.value ? Number(e.target.value) : null)}>
-                            <option value="">No dimension</option>
-                            {article.dimensions.map((d) => (
-                              <option key={d.dimension_id} value={d.dimension_id}>{d.dimension_name}</option>
-                            ))}
-                          </select>
-                          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="select-caret">
-                            <path d="M2.5 4.5L6 8l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-                          </svg>
-                        </div>
-                      ) : (
-                        <div className="form-input" style={{ color: COLORS.graphiteLight, background: COLORS.boneDim }}>{article ? "No dimensions" : "—"}</div>
-                      )}
+                      <input
+                        className="form-input"
+                        value={line.sizeText || ""}
+                        onChange={(e) => setLineField(lineIdx, "sizeText", e.target.value)}
+                        placeholder="e.g. 140x200"
+                      />
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-3">
                     <div>
                       <label className="form-label">Pack / CTN</label>
                       <input type="number" className="form-input" value={line.packPerCtn} onChange={(e) => setLineField(lineIdx, "packPerCtn", e.target.value)} placeholder="6" />
@@ -1050,6 +1873,104 @@ function AddOrderModal({ articles, onClose, onSave, isSaving, error }) {
                       <input className="form-input" value={qty && line.packPerCtn ? Math.ceil(qty / Number(line.packPerCtn)) : ""} disabled placeholder="auto" style={{ color: COLORS.graphiteLight, background: COLORS.boneDim }} />
                     </div>
                   </div>
+
+                  <div className="mb-3">
+                    <DepartmentToggles
+                      value={line.departments}
+                      onChange={(departments) => setLineField(lineIdx, "departments", departments)}
+                    />
+                  </div>
+
+                  {article?.addons?.length > 0 && (
+                    <div className="mb-3 rounded-xl p-3" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+                      <div className="text-[11px] font-semibold uppercase tracking-wide mb-2" style={{ color: COLORS.goldDim }}>
+                        Add-ons
+                      </div>
+                      <div className="flex flex-wrap gap-3">
+                        {article.addons.map((addon) => {
+                          const id = addon.addon_id || addon.id;
+                          const checked = (line.addonIds || []).includes(id);
+                          const bits = [];
+                          if (addon.extra_selling_price != null || addon.sellingPrice != null) {
+                            bits.push(`+${formatPKR(addon.extra_selling_price ?? addon.sellingPrice)}`);
+                          }
+                          if (addon.addon_rate != null || addon.addonRate != null) {
+                            bits.push(`pay ${formatPKR(addon.addon_rate ?? addon.addonRate)}`);
+                          }
+                          return (
+                            <label key={id} className="flex items-center gap-2 text-[12px]" style={{ color: COLORS.ink }}>
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={(e) => {
+                                  const ids = line.addonIds || [];
+                                  setLineField(
+                                    lineIdx,
+                                    "addonIds",
+                                    e.target.checked ? [...ids, id] : ids.filter((x) => x !== id)
+                                  );
+                                }}
+                              />
+                              {addon.addon_name || addon.name}
+                              {bits.length ? ` (${bits.join(" · ")})` : ""}
+                            </label>
+                          );
+                        })}
+                      </div>
+                      <p className="text-[10.5px] mt-2" style={{ color: COLORS.graphiteLight }}>
+                        Only checked add-ons show in Daily Entry (work type + Cut→Sti→Button flow). Leave unchecked to skip.
+                      </p>
+                    </div>
+                  )}
+
+                  {article && (() => {
+                    const tip = calcArticleOrderSuggestion(article, null, line.departments, {
+                      addonIds: line.addonIds || [],
+                      orderPriceOverride: line.orderPriceOverride === "" ? null : line.orderPriceOverride,
+                    });
+                    if (!tip) return null;
+                    return (
+                      <div className="rounded-xl p-3 mb-3 space-y-1.5" style={{ background: COLORS.goldSoft, border: `1px solid ${COLORS.border}` }}>
+                        <div className="text-[11px] font-semibold uppercase tracking-wide" style={{ color: COLORS.goldDim }}>
+                          Price per piece (PPP)
+                        </div>
+                        <div className="flex justify-between text-[12px]" style={{ color: COLORS.graphite }}>
+                          <span>Labor (selected depts)</span>
+                          <span>
+                            {formatPKR(tip.activeLabor)}
+                            {tip.activeLabor !== tip.fullLabor && (
+                              <span className="ml-1 line-through opacity-60">{formatPKR(tip.fullLabor)}</span>
+                            )}
+                          </span>
+                        </div>
+                        <div className="flex justify-between text-[12px]" style={{ color: COLORS.graphite }}>
+                          <span>Target margin</span>
+                          <span>{tip.targetMarginPercent}%</span>
+                        </div>
+                        <div className="flex justify-between text-[13px] font-semibold" style={{ color: COLORS.ink }}>
+                          <span>Suggested PPP</span>
+                          <span style={line.orderPriceOverride !== "" ? { textDecoration: "line-through" } : undefined}>
+                            {formatPKR(tip.suggestedPpp)}
+                          </span>
+                        </div>
+                        <div>
+                          <label className="form-label">Your price / piece (optional)</label>
+                          <input
+                            type="number"
+                            min="0"
+                            className="form-input"
+                            value={line.orderPriceOverride || ""}
+                            onChange={(e) => setLineField(lineIdx, "orderPriceOverride", e.target.value)}
+                            placeholder="Leave empty for suggested"
+                          />
+                        </div>
+                        <div className="flex justify-between text-[12px]" style={{ color: COLORS.green }}>
+                          <span>Profit / pc · margin</span>
+                          <span>{formatPKR(tip.profit)} · {tip.realizedMarginPercent}%</span>
+                        </div>
+                      </div>
+                    );
+                  })()}
 
                   <details className="mb-3">
                     <summary className="text-[11px] font-semibold cursor-pointer select-none" style={{ color: COLORS.goldDim }}>
@@ -1078,72 +1999,79 @@ function AddOrderModal({ articles, onClose, onSave, isSaving, error }) {
                   <div>
                     <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
                       <label className="form-label mb-0">Design / Color</label>
-                      {line.selectedVariantIds.length > 1 && (
-                        <div className="flex items-center gap-1 text-[11px] font-semibold">
-                          <button type="button" className={line.splitMode === "equal" ? "btn-primary" : "btn-secondary"} style={{ padding: "3px 9px", borderRadius: 6, background: line.splitMode === "equal" ? COLORS.gold : COLORS.card, color: line.splitMode === "equal" ? COLORS.ink : COLORS.graphite, border: `1px solid ${COLORS.border}` }} onClick={() => setSplitMode(lineIdx, "equal")}>
-                            Equal split
-                          </button>
-                          <button type="button" className={line.splitMode === "custom" ? "btn-primary" : "btn-secondary"} style={{ padding: "3px 9px", borderRadius: 6, background: line.splitMode === "custom" ? COLORS.gold : COLORS.card, color: line.splitMode === "custom" ? COLORS.ink : COLORS.graphite, border: `1px solid ${COLORS.border}` }} onClick={() => setSplitMode(lineIdx, "custom")}>
-                            Custom split
-                          </button>
-                        </div>
-                      )}
+                      <div className="flex items-center gap-2">
+                        {namedEntries.length > 1 && (
+                          <div className="flex items-center gap-1 text-[11px] font-semibold">
+                            <button type="button" className={line.splitMode === "equal" ? "btn-primary" : "btn-secondary"} style={{ padding: "3px 9px", borderRadius: 6, background: line.splitMode === "equal" ? COLORS.gold : COLORS.card, color: line.splitMode === "equal" ? COLORS.ink : COLORS.graphite, border: `1px solid ${COLORS.border}` }} onClick={() => setSplitMode(lineIdx, "equal")}>
+                              Equal split
+                            </button>
+                            <button type="button" className={line.splitMode === "custom" ? "btn-primary" : "btn-secondary"} style={{ padding: "3px 9px", borderRadius: 6, background: line.splitMode === "custom" ? COLORS.gold : COLORS.card, color: line.splitMode === "custom" ? COLORS.ink : COLORS.graphite, border: `1px solid ${COLORS.border}` }} onClick={() => setSplitMode(lineIdx, "custom")}>
+                              Custom split
+                            </button>
+                          </div>
+                        )}
+                        <button type="button" className="text-[11px] font-semibold px-2.5 py-1.5 rounded-lg" style={{ background: COLORS.goldSoft, color: COLORS.goldDim }} onClick={() => addDesignColor(lineIdx)}>
+                          + Add design / color
+                        </button>
+                      </div>
                     </div>
 
-                    {!article ? (
-                      <span className="text-[11px]" style={{ color: COLORS.graphiteLight }}>Select an article first</span>
-                    ) : article.variants?.length > 0 ? (
-                      <>
-                        <div className="flex flex-col gap-1.5">
-                          {article.variants.map((v) => {
-                            const checked = line.selectedVariantIds.includes(v.variant_id);
-                            const meta = line.variantMeta[v.variant_id] || { quantity: "", barcode: "" };
-                            return (
-                              <div key={v.variant_id} className="flex items-center gap-2 text-[12px] px-2.5 py-1.5 rounded-lg" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
-                                <input type="checkbox" checked={checked} onChange={() => toggleVariant(lineIdx, v.variant_id)} />
-                                <span className="flex-1" style={{ color: COLORS.ink }}>{v.variant_name}</span>
-                                {checked && (
-                                  <>
-                                    <input
-                                      className="form-input"
-                                      style={{ width: 130 }}
-                                      value={meta.barcode}
-                                      onChange={(e) => setVariantMeta(lineIdx, v.variant_id, "barcode", e.target.value)}
-                                      placeholder="barcode (optional)"
-                                    />
-                                    {line.splitMode === "custom" && line.selectedVariantIds.length > 1 ? (
-                                      <input
-                                        type="number"
-                                        className="form-input text-right"
-                                        style={{ width: 84 }}
-                                        value={meta.quantity}
-                                        onChange={(e) => setVariantMeta(lineIdx, v.variant_id, "quantity", e.target.value)}
-                                        placeholder="qty"
-                                      />
-                                    ) : (
-                                      <span className="text-[12px] font-semibold" style={{ width: 84, textAlign: "right", color: COLORS.graphite }}>
-                                        {(equalPreview ? equalPreview[v.variant_id] : qty).toLocaleString()}
-                                      </span>
-                                    )}
-                                  </>
-                                )}
-                              </div>
-                            );
-                          })}
-                        </div>
-                        {line.selectedVariantIds.length > 0 && (
-                          <p className="text-[11px] mt-1.5" style={{ color: splitError ? COLORS.rust : COLORS.graphiteLight }}>
-                            {line.splitMode === "custom" && line.selectedVariantIds.length > 1
-                              ? `Split: ${customSum.toLocaleString()} / ${qty.toLocaleString()} needed`
-                              : "Quantity split evenly across selected designs"}
-                          </p>
-                        )}
-                        {!line.selectedVariantIds.length && (
-                          <p className="text-[11px] mt-1.5" style={{ color: COLORS.graphiteLight }}>No design selected — quantity will be tracked without a design/color split.</p>
-                        )}
-                      </>
+                    {designColors.length === 0 ? (
+                      <p className="text-[11px]" style={{ color: COLORS.graphiteLight }}>No design/color yet — add entries like &quot;Olive green&quot; or &quot;Sunflower yellow&quot;, then split quantity across them.</p>
                     ) : (
-                      <span className="text-[11px]" style={{ color: COLORS.graphiteLight }}>This article has no design/color variants set up in Costing.</span>
+                      <div className="flex flex-col gap-1.5">
+                        {designColors.map((dc) => (
+                          <div key={dc.id} className="flex flex-wrap items-center gap-2 text-[12px] px-2.5 py-2 rounded-lg" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+                            <input
+                              className="form-input flex-1 min-w-[140px]"
+                              value={dc.name}
+                              onChange={(e) => updateDesignColor(lineIdx, dc.id, "name", e.target.value)}
+                              placeholder="e.g. Olive green"
+                            />
+                            <input
+                              className="form-input"
+                              style={{ width: 130 }}
+                              value={dc.barcode}
+                              onChange={(e) => updateDesignColor(lineIdx, dc.id, "barcode", e.target.value)}
+                              placeholder="barcode (optional)"
+                            />
+                            {namedEntries.length > 1 ? (
+                              line.splitMode === "custom" ? (
+                                <input
+                                  type="number"
+                                  className="form-input text-right"
+                                  style={{ width: 84 }}
+                                  value={dc.quantity}
+                                  onChange={(e) => updateDesignColor(lineIdx, dc.id, "quantity", e.target.value)}
+                                  placeholder="qty"
+                                />
+                              ) : (
+                                <span className="text-[12px] font-semibold shrink-0" style={{ width: 84, textAlign: "right", color: COLORS.graphite }}>
+                                  {dc.name.trim() ? (equalPreview?.[dc.id] ?? 0).toLocaleString() : "—"}
+                                </span>
+                              )
+                            ) : (
+                              <span className="text-[12px] font-semibold shrink-0" style={{ width: 84, textAlign: "right", color: COLORS.graphite }}>
+                                {dc.name.trim() ? qty.toLocaleString() : "—"}
+                              </span>
+                            )}
+                            <button type="button" className="text-[11px] font-semibold shrink-0 px-2" style={{ color: COLORS.rust }} onClick={() => removeDesignColor(lineIdx, dc.id)} aria-label="Remove">
+                              Remove
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {namedEntries.length > 1 && (
+                      <p className="text-[11px] mt-1.5" style={{ color: splitError ? COLORS.rust : COLORS.graphiteLight }}>
+                        {line.splitMode === "custom"
+                          ? `Split: ${customSum.toLocaleString()} / ${qty.toLocaleString()} needed`
+                          : "Quantity split evenly across design/color entries"}
+                      </p>
+                    )}
+                    {namedEntries.length === 1 && (
+                      <p className="text-[11px] mt-1.5" style={{ color: COLORS.graphiteLight }}>Full line quantity applies to this design/color.</p>
                     )}
                   </div>
                 </div>
@@ -1154,6 +2082,7 @@ function AddOrderModal({ articles, onClose, onSave, isSaving, error }) {
           <button type="button" className="btn-dashed mt-4 w-full justify-center py-3" onClick={addLine}>
             <PlusIcon /> Add order line
           </button>
+          </div>
         </div>
 
         <div className="sticky bottom-0 flex items-center justify-end gap-3 px-6 py-4" style={{ background: COLORS.card, borderTop: `1px solid ${COLORS.border}` }}>
@@ -1167,7 +2096,7 @@ function AddOrderModal({ articles, onClose, onSave, isSaving, error }) {
             onClick={handleSubmit}
             disabled={!isValid || isSaving}
           >
-            {isSaving ? "Saving…" : "Add order"}
+            {isSaving ? "Saving…" : editingOrder ? "Save changes" : "Add order"}
           </button>
         </div>
       </div>
@@ -1176,107 +2105,161 @@ function AddOrderModal({ articles, onClose, onSave, isSaving, error }) {
 }
 
 export default function OrdersPage() {
+  const { canWrite } = useAuth();
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("All statuses");
   const [orders, setOrders] = useState([]);
   const [articles, setArticles] = useState([]);
+  const [sets, setSets] = useState([]);
+  const [stationTotals, setStationTotals] = useState({});
+  const [addonTotals, setAddonTotals] = useState({});
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [openGroupId, setOpenGroupId] = useState(null);
   const [showAddModal, setShowAddModal] = useState(false);
+  const [editingOrder, setEditingOrder] = useState(null);
   const [isSavingOrder, setIsSavingOrder] = useState(false);
   const [saveOrderError, setSaveOrderError] = useState("");
-  const [invoiceGroupId, setInvoiceGroupId] = useState(null);
-  const [partialSplitGroup, setPartialSplitGroup] = useState(null);
-  const [isSplitting, setIsSplitting] = useState(false);
-  const [splitError, setSplitError] = useState("");
-  const [billNumbers, setBillNumbers] = useState({});
-  const [nextBillNo, setNextBillNo] = useState(2309);
-
-  async function fetchOrders() {
-    const res = await apiFetch("/api/orders");
-    if (!res.ok) throw new Error("Failed to load orders");
-    return res.json();
-  }
+  const [deletingOrderId, setDeletingOrderId] = useState(null);
 
   useEffect(() => {
-    async function fetchAll() {
+    let cancelled = false;
+    async function load() {
       setIsLoading(true);
       setLoadError("");
       try {
-        const [ordersData, artRes] = await Promise.all([fetchOrders(), apiFetch("/api/articles")]);
-        setOrders(ordersData);
-        setArticles(await artRes.json());
+        const [ordersRes, articlesRes, setsRes, totalsRes] = await Promise.all([
+          apiFetch("/api/orders"),
+          apiFetch("/api/articles"),
+          apiFetch("/api/sets"),
+          apiFetch("/api/production/station-totals"),
+        ]);
+        if (!ordersRes.ok) throw new Error(await readApiError(ordersRes, "Failed to load orders"));
+        if (!articlesRes.ok) throw new Error(await readApiError(articlesRes, "Failed to load articles"));
+        if (!setsRes.ok) throw new Error(await readApiError(setsRes, "Failed to load sets"));
+        const [ordersData, articlesData, setsData] = await Promise.all([
+          ordersRes.json(),
+          articlesRes.json(),
+          setsRes.json(),
+        ]);
+        if (cancelled) return;
+        setOrders(Array.isArray(ordersData) ? ordersData : []);
+        setArticles(Array.isArray(articlesData) ? articlesData.map(articleToLegacy) : []);
+        setSets(Array.isArray(setsData) ? setsData : []);
+        if (totalsRes.ok) {
+          const totalsData = await totalsRes.json();
+          if (totalsData?.stations && typeof totalsData.stations === "object") {
+            setStationTotals(totalsData.stations);
+            setAddonTotals(totalsData.addons || {});
+          } else {
+            const { stations: _s, addons: a, ...rest } = totalsData || {};
+            setStationTotals(rest);
+            setAddonTotals(a || {});
+          }
+        }
       } catch (err) {
-        console.error("Failed to load orders/articles", err);
-        setLoadError("Couldn't load orders from the server. Try refreshing the page.");
+        console.error(err);
+        if (!cancelled) setLoadError(err.message || "Could not load orders");
       } finally {
-        setIsLoading(false);
+        if (!cancelled) setIsLoading(false);
       }
     }
-    fetchAll();
+    load();
+    return () => { cancelled = true; };
   }, []);
+
+  const refreshStationTotals = async () => {
+    try {
+      const totalsRes = await apiFetch("/api/production/station-totals");
+      if (!totalsRes.ok) return;
+      const totalsData = await totalsRes.json();
+      if (totalsData?.stations && typeof totalsData.stations === "object") {
+        setStationTotals(totalsData.stations);
+        setAddonTotals(totalsData.addons || {});
+      } else {
+        const { stations: _s, addons: a, ...rest } = totalsData || {};
+        setStationTotals(rest);
+        setAddonTotals(a || {});
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  useEffect(() => {
+    if (openGroupId) refreshStationTotals();
+  }, [openGroupId]);
 
   const orderGroups = useMemo(() => orders.map((o) => calcGroup(transformOrder(o))), [orders]);
   const openGroup = useMemo(() => orderGroups.find((g) => g.id === openGroupId) || null, [orderGroups, openGroupId]);
-  const invoiceGroup = useMemo(() => orderGroups.find((g) => g.id === invoiceGroupId) || null, [orderGroups, invoiceGroupId]);
-  const partialGroupLive = useMemo(
-    () => (partialSplitGroup ? orderGroups.find((g) => g.id === partialSplitGroup.id) || null : null),
-    [orderGroups, partialSplitGroup]
-  );
 
-  function handleOpenInvoice(group) {
-    if (!billNumbers[group.id]) {
-      setBillNumbers((prev) => ({ ...prev, [group.id]: nextBillNo }));
-      setNextBillNo((n) => n + 1);
-    }
-    setInvoiceGroupId(group.id);
+  function handleStartEdit(group) {
+    if (isShipped(group)) return;
+    const rawOrder = orders.find((o) => o.order_id === group.id);
+    if (!rawOrder) return;
+    setSaveOrderError("");
+    setEditingOrder(rawOrder);
+    setShowAddModal(true);
     setOpenGroupId(null);
   }
 
   async function handleSaveOrder(payload) {
     setIsSavingOrder(true);
     setSaveOrderError("");
+    const isEdit = Boolean(editingOrder);
     try {
-      const res = await apiFetch("/api/orders", {
-        method: "POST",
+      const res = await apiFetch(isEdit ? `/api/orders/${editingOrder.order_id}` : "/api/orders", {
+        method: isEdit ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Something went wrong saving the order");
-      setOrders((prev) => [data, ...prev]);
+      if (!res.ok) {
+        setSaveOrderError(await readApiError(res, "Failed to save order"));
+        return;
+      }
+      const saved = await res.json();
+      setOrders((prev) => {
+        const exists = prev.some((o) => o.order_id === saved.order_id);
+        if (exists) return prev.map((o) => (o.order_id === saved.order_id ? saved : o));
+        return [saved, ...prev];
+      });
       setShowAddModal(false);
+      setEditingOrder(null);
     } catch (err) {
-      console.error("Failed to save order", err);
-      setSaveOrderError(err.message);
+      console.error(err);
+      setSaveOrderError("Could not reach the server");
     } finally {
       setIsSavingOrder(false);
     }
   }
 
-  async function handleConfirmSplit(group) {
-    setIsSplitting(true);
-    setSplitError("");
+  async function handleDeleteOrder(group) {
+    if (!window.confirm(`Delete order ATM ${group.atmNo} (${group.customer})?`)) return;
     try {
-      const res = await apiFetch(`/api/orders/${group.id}/split`, { method: "POST" });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Something went wrong splitting the order");
-      setOrders((prev) => [data.shipped, data.balance, ...prev.filter((o) => o.order_id !== group.id)]);
-      setPartialSplitGroup(null);
-      handleOpenInvoice(calcGroup(transformOrder(data.shipped)));
+      const res = await apiFetch(`/api/orders/${group.id}`, { method: "DELETE" });
+      if (!res.ok) {
+        window.alert(await readApiError(res, "Failed to delete order"));
+        return;
+      }
+      setOrders((prev) => prev.filter((order) => order.order_id !== group.id));
+      setOpenGroupId(null);
     } catch (err) {
-      console.error("Failed to split order", err);
-      setSplitError(err.message);
-    } finally {
-      setIsSplitting(false);
+      console.error(err);
+      window.alert("Could not reach the server");
     }
   }
 
   const filtered = useMemo(() => {
     return orderGroups
-      .filter((g) => (statusFilter === "All statuses" ? true : statusOf(g.percent) === statusFilter))
+      .filter((g) => {
+        // Closed/shipped only when filter is "Shipped" — hidden from All statuses
+        if (statusFilter === "All statuses") return !isShipped(g);
+        if (statusFilter === "Shipped") return isShipped(g);
+        if (statusFilter === "Waiting for Shipment") return isAwaitingShipment(g);
+        if (isShipped(g) || isAwaitingShipment(g)) return false;
+        return statusOf(g.percent) === statusFilter;
+      })
       .filter((g) => {
         const q = search.toLowerCase();
         return g.customer.toLowerCase().includes(q) || g.atmNo.includes(q) || g.lines.some((l) => String(l.orderId).includes(q));
@@ -1306,9 +2289,11 @@ export default function OrdersPage() {
             </div>
           </div>
           <div className="flex items-center gap-2.5 shrink-0">
-            <button type="button" className="btn-primary inline-flex items-center gap-1.5 text-[12.5px] font-semibold px-3.5 py-2 rounded-lg" style={{ background: COLORS.gold, color: COLORS.ink }} onClick={() => { setSaveOrderError(""); setShowAddModal(true); }}>
-              <PlusIcon /> <span className="hidden xs:inline">New order</span>
-            </button>
+            {canWrite ? (
+              <button type="button" className="btn-primary inline-flex items-center gap-1.5 text-[12.5px] font-semibold px-3.5 py-2 rounded-lg" style={{ background: COLORS.gold, color: COLORS.ink }} onClick={() => { setSaveOrderError(""); setEditingOrder(null); setShowAddModal(true); }}>
+                <PlusIcon /> <span className="hidden xs:inline">New order</span>
+              </button>
+            ) : null}
             <div className="w-9 h-9 rounded-full flex items-center justify-center text-[13px] font-semibold shrink-0" style={{ background: COLORS.ink, color: COLORS.gold, border: `2px solid ${COLORS.goldSoft}` }}>
               A
             </div>
@@ -1316,6 +2301,7 @@ export default function OrdersPage() {
         </div>
 
         <div className="p-5 md:p-8 max-w-7xl mx-auto">
+          <ReadOnlyBanner />
           {loadError && (
             <div className="rounded-xl px-4 py-3 mb-5 text-[12.5px]" style={{ background: COLORS.rustSoft, color: COLORS.rust }}>{loadError}</div>
           )}
@@ -1324,7 +2310,13 @@ export default function OrdersPage() {
             <MiniStat index={0} icon={<OrdersStatIcon />} label="ATM orders" value={totalOrders} sub="active on the floor" />
             <MiniStat index={1} icon={<SetsIcon />} label="Total sets" value={totalSets.toLocaleString()} sub="across all orders" />
             <MiniStat index={2} icon={<BoxIcon />} label="Cartons ready" value={`${readyCartons.toLocaleString()} / ${totalCartons.toLocaleString()}`} sub="packed vs required" />
-            <MiniStat index={3} icon={<ProgressIcon />} label="In progress" value={orderGroups.filter((g) => statusOf(g.percent) === "In progress").length} sub={`${orderGroups.filter((g) => statusOf(g.percent) === "Not started").length} not started`} />
+            <MiniStat
+              index={3}
+              icon={<ProgressIcon />}
+              label="Waiting shipment"
+              value={orderGroups.filter((g) => isAwaitingShipment(g)).length}
+              sub={`${orderGroups.filter((g) => statusOf(g.percent) === "In progress" && !isAwaitingShipment(g)).length} in progress`}
+            />
           </div>
 
           <div className="flex flex-wrap items-center gap-3 mb-4">
@@ -1334,7 +2326,7 @@ export default function OrdersPage() {
             </div>
             <div className="select-wrap">
               <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
-                {["All statuses", "Not started", "In progress", "Complete"].map((opt) => (
+                {["All statuses", "Not started", "In progress", "Complete", "Waiting for Shipment", "Shipped"].map((opt) => (
                   <option key={opt} value={opt}>{opt}</option>
                 ))}
               </select>
@@ -1352,8 +2344,6 @@ export default function OrdersPage() {
                 group={group}
                 index={i}
                 onOpen={(g) => setOpenGroupId(g.id)}
-                onInvoice={handleOpenInvoice}
-                onPartialSplit={(g) => { setSplitError(""); setPartialSplitGroup(g); }}
               />
             ))}
             {!isLoading && filtered.length === 0 && (
@@ -1365,26 +2355,29 @@ export default function OrdersPage() {
         </div>
       </div>
 
-      {openGroup && <OrderDetailModal group={openGroup} onClose={() => setOpenGroupId(null)} onInvoice={handleOpenInvoice} />}
-      {partialGroupLive && (
-        <PartialOrderModal
-          group={partialGroupLive}
-          onClose={() => setPartialSplitGroup(null)}
-          onConfirmSplit={handleConfirmSplit}
-          isSaving={isSplitting}
-          error={splitError}
+      {openGroup && (
+        <OrderDetailModal
+          group={openGroup}
+          stationTotals={stationTotals}
+          addonTotals={addonTotals}
+          onClose={() => setOpenGroupId(null)}
+          onEdit={handleStartEdit}
+          onDelete={handleDeleteOrder}
+          isDeleting={deletingOrderId === openGroup.id}
+          canWrite={canWrite}
         />
       )}
-      {showAddModal && (
+      {canWrite && showAddModal && (
         <AddOrderModal
           articles={articles}
-          onClose={() => setShowAddModal(false)}
+          sets={sets}
+          editingOrder={editingOrder}
+          onClose={() => { setShowAddModal(false); setEditingOrder(null); }}
           onSave={handleSaveOrder}
           isSaving={isSavingOrder}
           error={saveOrderError}
         />
       )}
-      {invoiceGroup && <InvoiceModal group={invoiceGroup} billNo={billNumbers[invoiceGroup.id]} onClose={() => setInvoiceGroupId(null)} />}
 
 
       <style>{`
