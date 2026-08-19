@@ -97,22 +97,33 @@ function buildPackItems(order) {
       seen.add(gk);
       const groupLines = lines.filter((l) => setGroupKey(l) === gk);
       const meta = lineSetMeta(line) || {};
-      const size = meta.sizeText || meta.configurationName || line.dimension_name || "";
+      const size = meta.measurement || meta.sizeText || meta.sizeName || line.dimension_name || "";
+      const material = meta.materialName || "";
+      const title = meta.setName || [meta.articleName, meta.typeName].filter(Boolean).join(" · ") || "Set";
+      const bits = [title, material, size].filter(Boolean);
       items.push({
         type: "set",
         key: `set:${gk}`,
         groupKey: gk,
         lines: groupLines,
         primaryLine: groupLines[0],
-        label: `${meta.setName || "Set"}${size ? ` · ${size}` : ""}`,
-        setName: meta.setName || "Set",
+        label: bits.join(" · "),
+        setName: title,
+        setPackingRate:
+          meta.setPackingRate != null
+            ? Number(meta.setPackingRate) || 0
+            : setPackRatePerSet(groupLines),
       });
     } else if (!skipMap(line).Packing) {
+      const meta = lineSetMeta(line) || {};
+      const size = meta.measurement || meta.sizeText || line.dimension_name || "";
+      const material = meta.materialName || "";
+      const title = line.article_name || meta.typeName || "Item";
       items.push({
         type: "article",
         key: `art:${line.order_line_id}`,
         line,
-        label: `${line.article_name}${line.dimension_name ? ` · ${line.dimension_name}` : ""}`,
+        label: [title, material, size].filter(Boolean).join(" · "),
       });
     }
   }
@@ -148,8 +159,16 @@ function matchVariantByDesign(line, designName) {
   return vars.find((v) => String(v.variant_name || "Default").trim() === name) || vars[0] || null;
 }
 
-/** Rate paid per complete set packed (sum of part packing rates × qty/set). */
+/** Rate paid per complete set packed (prefer setPackingRate snapshot; else legacy sum). */
 function setPackRatePerSet(groupLines) {
+  const first = (groupLines || [])[0];
+  const meta = first?.set_order_meta || first?.set_meta || {};
+  if (meta.setPackingRate != null && meta.setPackingRate !== "") {
+    return Number(meta.setPackingRate) || 0;
+  }
+  if (meta.packingRate != null && meta.packingRate !== "") {
+    return Number(meta.packingRate) || 0;
+  }
   return (groupLines || []).reduce((sum, l) => {
     return sum + (Number(l.packing_rate) || 0) * qtyPerSetOf(l);
   }, 0);
@@ -202,6 +221,13 @@ function PlusIcon() {
 
 function stationRate(line, station) {
   if (!line) return 0;
+  if (station === "Packing") {
+    const meta = line.set_order_meta || line.set_meta || {};
+    // Single-piece / display: prefer explicit set packing when present without multi-part group
+    if (meta.setPackingRate != null && meta.setPackingRate !== "" && !meta.setId) {
+      return Number(meta.setPackingRate) || 0;
+    }
+  }
   const map = {
     Cutting: line.cutting_rate,
     Stitching: line.stitching_rate,
@@ -1529,8 +1555,11 @@ export default function DailyEntryPage() {
                   {isSetPack ? (
                     <>
                       <p className="text-[11px] mb-1.5" style={{ color: COLORS.graphite }}>
-                        Packs as one set:{" "}
+                        Packs as one set (packing pay 1×):{" "}
                         {setGroupLines.map((gl) => `${qtyPerSetOf(gl)}× ${partNameOf(gl)}`).join(" + ")}
+                      </p>
+                      <p className="text-[11px] mb-1.5" style={{ color: COLORS.graphiteLight }}>
+                        Enter complete sets — each part is caught up automatically
                       </p>
                       {setPackHint && (
                         <p className="text-[11px]" style={{ color: COLORS.goldDim }}>

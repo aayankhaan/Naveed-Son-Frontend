@@ -8,6 +8,7 @@ import {
   formatPKR,
   genId,
   labourTotal,
+  partLabourTotal,
 } from "../../lib/costingV2";
 
 function Block({ title, children, action, last }) {
@@ -82,15 +83,23 @@ function ChipInput({ values, onChange, placeholder }) {
   );
 }
 
-function LabourFields({ labour, onChange }) {
+function LabourFields({ labour, onChange, stations = STATION_ORDER }) {
+  const cols = Math.min(stations.length, 4);
   return (
     <div
       className="grid gap-2"
-      style={{ gridTemplateColumns: "repeat(4, minmax(0, 1fr))" }}
+      style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}
     >
-      {STATION_ORDER.map((station) => {
+      {stations.map((station) => {
         const key = `${station.toLowerCase()}Rate`;
-        const short = station === "Stitching" ? "Stitch" : station === "Checking" ? "Check" : station === "Packing" ? "Pack" : "Cut";
+        const short =
+          station === "Stitching"
+            ? "Stitch"
+            : station === "Checking"
+              ? "Check"
+              : station === "Packing"
+                ? "Pack"
+                : "Cut";
         return (
           <div key={station}>
             <label className="form-label text-center">{short}</label>
@@ -118,6 +127,9 @@ function LabourFields({ labour, onChange }) {
     </div>
   );
 }
+
+const PART_STATIONS = ["Cutting", "Stitching", "Checking"];
+const PACK_STATIONS = ["Packing"];
 
 function QtyBySizeRow({ sizes, qtyBySize, onChange }) {
   if (!sizes.length) return null;
@@ -552,15 +564,18 @@ export default function TypeEditor({ initialType, articleName, onSave, onCancel 
                     <>
                       <div className="flex items-baseline justify-between mb-2">
                         <span className="text-[10.5px] font-semibold uppercase tracking-wide" style={{ color: COLORS.graphite }}>
-                          Wages / pc
+                          Cut / Stitch / Check
                         </span>
                         <span className="text-[11px]" style={{ color: COLORS.graphiteLight }}>
-                          {formatPKR(labourTotal(part.labour))}
+                          {formatPKR(partLabourTotal(part.labour))}
                         </span>
                       </div>
                       <LabourFields
+                        stations={PART_STATIONS}
                         labour={part.labour}
-                        onChange={(labour) => updatePart(part.id, { labour })}
+                        onChange={(labour) =>
+                          updatePart(part.id, { labour: { ...labour, packingRate: 0 } })
+                        }
                       />
                     </>
                   ) : (
@@ -569,17 +584,21 @@ export default function TypeEditor({ initialType, articleName, onSave, onCancel 
                         <div key={s.id}>
                           <div className="flex items-baseline justify-between mb-2">
                             <span className="text-[12px] font-medium" style={{ color: COLORS.ink }}>
-                              Wages — {s.name}
+                              Cut / Stitch / Check — {s.name}
                             </span>
                             <span className="text-[11px]" style={{ color: COLORS.graphiteLight }}>
-                              {formatPKR(labourTotal(part.labourBySize?.[s.id]))}
+                              {formatPKR(partLabourTotal(part.labourBySize?.[s.id]))}
                             </span>
                           </div>
                           <LabourFields
+                            stations={PART_STATIONS}
                             labour={part.labourBySize?.[s.id] || emptyLabour()}
                             onChange={(labour) =>
                               updatePart(part.id, {
-                                labourBySize: { ...part.labourBySize, [s.id]: labour },
+                                labourBySize: {
+                                  ...part.labourBySize,
+                                  [s.id]: { ...labour, packingRate: 0 },
+                                },
                               })
                             }
                           />
@@ -589,6 +608,78 @@ export default function TypeEditor({ initialType, articleName, onSave, onCancel 
                   )}
                 </div>
               ))}
+
+              {/* Packing = 1× for whole set */}
+              <div
+                className="rounded-xl p-4"
+                style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}
+              >
+                <div className="flex items-baseline justify-between mb-2">
+                  <div>
+                    <div className="text-[13px] font-semibold" style={{ color: COLORS.ink }}>
+                      Packing (whole set)
+                    </div>
+                    <p className="text-[11.5px] mt-0.5" style={{ color: COLORS.graphiteLight }}>
+                      Once per set — not per part
+                    </p>
+                  </div>
+                  <span className="text-[11px]" style={{ color: COLORS.graphiteLight }}>
+                    {formatPKR(
+                      Number(
+                        type.labourSameForAllSizes
+                          ? type.labour?.packingRate
+                          : type.labourBySize?.[sizes[0]?.id]?.packingRate
+                      ) || 0
+                    )}
+                  </span>
+                </div>
+                {type.labourSameForAllSizes ? (
+                  <LabourFields
+                    stations={PACK_STATIONS}
+                    labour={type.labour}
+                    onChange={(labour) =>
+                      patch({
+                        labour: {
+                          ...type.labour,
+                          packingRate: labour.packingRate,
+                          cuttingRate: 0,
+                          stitchingRate: 0,
+                          checkingRate: 0,
+                        },
+                      })
+                    }
+                  />
+                ) : sizes.length ? (
+                  <div className="space-y-3">
+                    {sizes.map((s) => (
+                      <div key={s.id}>
+                        <div className="text-[12px] font-medium mb-1.5" style={{ color: COLORS.graphite }}>
+                          {s.name}
+                        </div>
+                        <LabourFields
+                          stations={PACK_STATIONS}
+                          labour={type.labourBySize?.[s.id] || emptyLabour()}
+                          onChange={(labour) =>
+                            patch({
+                              labourBySize: {
+                                ...type.labourBySize,
+                                [s.id]: {
+                                  cuttingRate: 0,
+                                  stitchingRate: 0,
+                                  checkingRate: 0,
+                                  packingRate: labour.packingRate,
+                                },
+                              },
+                            })
+                          }
+                        />
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-[12px]" style={{ color: COLORS.graphiteLight }}>Add sizes first.</p>
+                )}
+              </div>
             </div>
           )}
         </Block>

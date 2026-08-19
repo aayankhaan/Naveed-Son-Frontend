@@ -13,17 +13,34 @@ export function emptyLabour() {
   return { cuttingRate: "", stitchingRate: "", checkingRate: "", packingRate: "" };
 }
 
-export function labourTotal(labour) {
+/** Cut + Stitch + Check only (packing is set-level) */
+export function partLabourTotal(labour) {
   if (!labour) return 0;
   return (
     (Number(labour.cuttingRate) || 0) +
     (Number(labour.stitchingRate) || 0) +
-    (Number(labour.checkingRate) || 0) +
-    (Number(labour.packingRate) || 0)
+    (Number(labour.checkingRate) || 0)
   );
 }
 
-/** Labour for one complete unit of a type at a given size (sum parts × qty + type labour if no parts) */
+export function labourTotal(labour) {
+  if (!labour) return 0;
+  return partLabourTotal(labour) + (Number(labour.packingRate) || 0);
+}
+
+function packingAtSize(type, sizeId) {
+  const same = type.labourSameForAllSizes !== false;
+  const L = same
+    ? type.labour
+    : (type.labourBySize && type.labourBySize[sizeId]) || type.labour;
+  return Number(L?.packingRate) || 0;
+}
+
+/**
+ * Labour for one complete set/unit at a size:
+ * - no parts → all 4 stations on type
+ * - with parts → (Cut+Stitch+Check)×qty per part + Packing 1× on type
+ */
 export function calcTypeLabourAtSize(type, sizeId) {
   const same = type.labourSameForAllSizes !== false;
   const parts = type.parts || [];
@@ -40,8 +57,9 @@ export function calcTypeLabourAtSize(type, sizeId) {
       const L = same
         ? part.labour
         : (part.labourBySize && part.labourBySize[sizeId]) || part.labour;
-      total += labourTotal(L) * qty;
+      total += partLabourTotal(L) * qty;
     }
+    total += packingAtSize(type, sizeId);
   }
 
   for (const a of type.addons || []) {

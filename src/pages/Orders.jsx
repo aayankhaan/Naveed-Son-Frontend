@@ -14,7 +14,7 @@ import Sidebar from "../components/layout/Sidebar";
 import MiniStat from "../components/ui/MiniStat";
 import { SearchIcon, ChevronIcon, CloseIcon } from "../components/icons/CommonIcons";
 import { apiFetch } from "../lib/api";
-import { flattenSetOrderToLines, articleToLegacy, calcArticleOrderSuggestion } from "../lib/manufacturingPricing";
+import { flattenSetOrderToLines } from "../lib/manufacturingPricing";
 import {
   STATION_ORDER,
   emptyStationTotals,
@@ -23,10 +23,8 @@ import {
   skipMap,
   addonWipQty,
 } from "../lib/productionFlow";
-import SetOrderBuilder, {
-  DepartmentToggles,
-  DEFAULT_DEPARTMENTS,
-} from "../components/orders/SetOrderBuilder";
+import AddOrderModal from "../components/orders/AddOrderModal";
+import { DEFAULT_DEPARTMENTS } from "../components/orders/SetOrderBuilder";
 import OrderAtmExpenses from "../components/orders/OrderAtmExpenses";
 import { useAuth } from "../context/AuthContext";
 import ReadOnlyBanner from "../components/auth/ReadOnlyBanner";
@@ -1633,477 +1631,6 @@ function draftLineToApiLine(l, articles) {
   };
 }
 
-function AddOrderModal({ articles, sets, editingOrder, onClose, onSave, isSaving, error }) {
-  const initialSetBlocks = editingOrder ? setBlocksFromOrder(editingOrder, sets) : undefined;
-  const [draft, setDraft] = useState(() => (editingOrder ? draftFromOrder(editingOrder) : { ...emptyDraft(), date: todayISO() }));
-  const [showSetBuilder, setShowSetBuilder] = useState(() =>
-    editingOrder ? initialSetBlocks.length > 0 : true
-  );
-  const [setDraftState, setSetDraftState] = useState({ canApply: false, payloads: [], grandTotal: 0, error: null });
-
-  useEffect(() => {
-    const onKey = (e) => e.key === "Escape" && onClose();
-    document.addEventListener("keydown", onKey);
-    document.body.style.overflow = "hidden";
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      document.body.style.overflow = "";
-    };
-  }, [onClose]);
-
-  function setField(field, value) {
-    setDraft((d) => ({ ...d, [field]: value }));
-  }
-  function setLineField(idx, field, value) {
-    setDraft((d) => ({ ...d, lines: d.lines.map((l, i) => (i === idx ? { ...l, [field]: value } : l)) }));
-  }
-  function setLineArticle(idx, articleId) {
-    // Add-ons opt-in: only appear in Daily Entry when checked on this order line
-    setDraft((d) => ({
-      ...d,
-      lines: d.lines.map((l, i) =>
-        i !== idx
-          ? l
-          : {
-              ...l,
-              articleId,
-              dimensionId: null,
-              sizeText: "",
-              orderPriceOverride: "",
-              designColors: [],
-              splitMode: "equal",
-              addonIds: [],
-            }
-      ),
-    }));
-  }
-
-  function addLine() {
-    setDraft((d) => ({ ...d, lines: [...d.lines, emptyLine()] }));
-  }
-  function removeLine(idx) {
-    setDraft((d) => ({ ...d, lines: d.lines.filter((_, i) => i !== idx) }));
-  }
-  function addDesignColor(lineIdx) {
-    setDraft((d) => ({
-      ...d,
-      lines: d.lines.map((l, i) => (i !== lineIdx ? l : { ...l, designColors: [...(l.designColors || []), emptyDesignColor()] })),
-    }));
-  }
-  function updateDesignColor(lineIdx, dcId, field, value) {
-    setDraft((d) => ({
-      ...d,
-      lines: d.lines.map((l, i) => (i !== lineIdx ? l : {
-        ...l,
-        designColors: (l.designColors || []).map((dc) => (dc.id === dcId ? { ...dc, [field]: value } : dc)),
-      })),
-    }));
-  }
-  function removeDesignColor(lineIdx, dcId) {
-    setDraft((d) => ({
-      ...d,
-      lines: d.lines.map((l, i) => (i !== lineIdx ? l : { ...l, designColors: (l.designColors || []).filter((dc) => dc.id !== dcId) })),
-    }));
-  }
-  function setSplitMode(lineIdx, mode) {
-    setLineField(lineIdx, "splitMode", mode);
-  }
-
-  const articleLinesReady = draft.lines.some((l) => {
-    if (!(l.articleId && Number(l.quantity) > 0)) return false;
-    const d = { ...DEFAULT_DEPARTMENTS, ...(l.departments || {}) };
-    return d.cutting || d.stitching || d.checking || d.packing;
-  });
-  const articleSplitsOk = draft.lines.every((l) => !(l.articleId && Number(l.quantity) > 0) || !lineSplitError(l));
-  const setLinesReady = Boolean(setDraftState.canApply && setDraftState.payloads.length);
-  const isValid =
-    Boolean(draft.atmNo.trim() && draft.customer.trim()) &&
-    (articleLinesReady || setLinesReady) &&
-    articleSplitsOk;
-
-  function handleSubmit() {
-    if (!isValid || isSaving) return;
-
-    const fromArticles = draft.lines
-      .filter((l) => l.articleId && Number(l.quantity) > 0)
-      .map((l) => draftLineToApiLine(l, articles));
-
-    const fromSets = setLinesReady
-      ? setPayloadsToDraftLines(setDraftState.payloads).map((l) => draftLineToApiLine(l, articles))
-      : [];
-
-    const cleanLines = [...fromArticles, ...fromSets];
-    if (!cleanLines.length) return;
-
-    onSave({
-      atm_no: draft.atmNo.trim(),
-      customer: draft.customer.trim(),
-      order_date: draft.date || todayISO(),
-      notes: "",
-      lines: cleanLines,
-    });
-  }
-
-  return (
-    <div className="modal-overlay fixed inset-0 z-60 flex items-center justify-center p-3 sm:p-6" onClick={onClose}>
-      <div
-        className="modal-pop w-full max-w-3xl max-h-[92vh] overflow-y-auto rounded-2xl"
-        style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}
-        onClick={(e) => e.stopPropagation()}
-        role="dialog"
-        aria-modal="true"
-      >
-        <div className="flex items-start justify-between gap-3 px-6 py-5 sticky top-0 z-10" style={{ background: COLORS.card, borderBottom: `1px solid ${COLORS.border}` }}>
-          <div>
-            <h2 className="text-[16px] font-semibold" style={{ color: COLORS.ink }}>{editingOrder ? "Edit order" : "New order"}</h2>
-            <p className="text-[11.5px] mt-0.5" style={{ color: COLORS.graphiteLight }}>
-              {editingOrder
-                ? `Editing ATM ${editingOrder.atm_no} · ${editingOrder.customer}`
-                : "Article lines, set order, or both — then Add order"}
-            </p>
-          </div>
-          <button type="button" className="btn-secondary p-2 rounded-lg shrink-0" style={{ border: `1px solid ${COLORS.border}`, color: COLORS.graphite }} onClick={onClose} aria-label="Close">
-            <CloseIcon />
-          </button>
-        </div>
-
-        <div className="p-6">
-          {error && (
-            <div className="rounded-xl px-4 py-3 mb-4 text-[12px]" style={{ background: COLORS.rustSoft, color: COLORS.rust }}>{error}</div>
-          )}
-
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-6">
-            <div>
-              <label className="form-label">ATM No</label>
-              <input className="form-input" value={draft.atmNo} onChange={(e) => setField("atmNo", e.target.value)} placeholder="e.g. 4431" />
-            </div>
-            <div>
-              <label className="form-label">Customer</label>
-              <input className="form-input" value={draft.customer} onChange={(e) => setField("customer", e.target.value)} placeholder="e.g. ZEEMAN" />
-            </div>
-            <div>
-              <label className="form-label">Date</label>
-              <input type="date" className="form-input" value={draft.date} onChange={(e) => setField("date", e.target.value)} />
-            </div>
-          </div>
-
-          <div className="flex flex-wrap gap-2 mb-5">
-            <button type="button" className="text-[12px] px-3.5 py-2 rounded-lg font-semibold" style={{ background: !showSetBuilder ? COLORS.gold : COLORS.card, color: COLORS.ink, border: `1px solid ${COLORS.border}` }} onClick={() => setShowSetBuilder(false)}>
-              Article lines{articleLinesReady ? ` · ${draft.lines.filter((l) => l.articleId && Number(l.quantity) > 0).length}` : ""}
-            </button>
-            <button type="button" className="text-[12px] px-3.5 py-2 rounded-lg font-semibold" style={{ background: showSetBuilder ? COLORS.gold : COLORS.card, color: COLORS.ink, border: `1px solid ${COLORS.border}` }} onClick={() => setShowSetBuilder(true)}>
-              Set order{setLinesReady ? ` · ${setDraftState.payloads.length}` : ""}
-            </button>
-          </div>
-
-          <div style={{ display: showSetBuilder ? "block" : "none" }}>
-            <SetOrderBuilder
-              sets={sets}
-              onDraftChange={setSetDraftState}
-              initialBlocks={initialSetBlocks}
-            />
-          </div>
-
-          <div style={{ display: showSetBuilder ? "none" : "block" }}>
-          <div className="flex flex-col gap-4">
-            {draft.lines.map((line, lineIdx) => {
-              const article =
-                articles.find((a) => a.article_id === line.articleId)
-                || articles.find((a) => a.article_id === `ART-${line.articleId}`)
-                || articles.find((a) => String(a.article_id).replace(/^ART-/, "") === String(line.articleId || "").replace(/^ART-/, ""))
-                || null;
-              const qty = Number(line.quantity) || 0;
-              const designColors = line.designColors || [];
-              const namedEntries = designColors.filter((dc) => dc.name?.trim());
-              const splitError = lineSplitError(line);
-              const equalPreview = line.splitMode === "equal" && namedEntries.length > 1 ? equalSplit(qty, namedEntries.map((dc) => dc.id)) : null;
-              const customSum = namedEntries.reduce((s, dc) => s + (Number(dc.quantity) || 0), 0);
-
-              return (
-                <div key={lineIdx} className="line-card rounded-2xl p-4" style={{ border: `1.5px dashed ${COLORS.boneBorder}`, background: COLORS.bone }}>
-                  <div className="flex items-center justify-between mb-3">
-                    <span className="text-[11.5px] font-semibold uppercase tracking-wide" style={{ color: COLORS.graphite }}>Order line {lineIdx + 1}</span>
-                    {draft.lines.length > 1 && (
-                      <button type="button" className="icon-btn-remove" onClick={() => removeLine(lineIdx)} aria-label="Remove line">
-                        <TrashIcon />
-                      </button>
-                    )}
-                  </div>
-
-                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-3">
-                    <div className="sm:col-span-2">
-                      <label className="form-label">Article</label>
-                      <div className="select-wrap w-full">
-                        <select className="w-full" value={line.articleId ?? ""} onChange={(e) => setLineArticle(lineIdx, e.target.value || null)}>
-                          <option value="">Select article…</option>
-                          {articles.map((a) => (
-                            <option key={a.article_id} value={a.article_id}>{a.article_name}</option>
-                          ))}
-                        </select>
-                        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" className="select-caret">
-                          <path d="M2.5 4.5L6 8l3.5-3.5" stroke={COLORS.graphite} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-                        </svg>
-                      </div>
-                      {line.articleLabel && line.articleLabel !== articles.find((a) => a.article_id === line.articleId)?.article_name && (
-                        <p className="text-[10.5px] mt-1" style={{ color: COLORS.goldDim }}>{line.articleLabel}</p>
-                      )}
-                    </div>
-                    <div>
-                      <label className="form-label">Size</label>
-                      <input
-                        className="form-input"
-                        value={line.sizeText || ""}
-                        onChange={(e) => setLineField(lineIdx, "sizeText", e.target.value)}
-                        placeholder="e.g. 140x200"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-3">
-                    <div>
-                      <label className="form-label">Pack / CTN</label>
-                      <input type="number" className="form-input" value={line.packPerCtn} onChange={(e) => setLineField(lineIdx, "packPerCtn", e.target.value)} placeholder="6" />
-                    </div>
-                    <div>
-                      <label className="form-label">Quantity</label>
-                      <input type="number" className="form-input" value={line.quantity} onChange={(e) => setLineField(lineIdx, "quantity", e.target.value)} placeholder="5502" />
-                    </div>
-                    <div>
-                      <label className="form-label">Reqd CTNS</label>
-                      <input className="form-input" value={qty && line.packPerCtn ? Math.ceil(qty / Number(line.packPerCtn)) : ""} disabled placeholder="auto" style={{ color: COLORS.graphiteLight, background: COLORS.boneDim }} />
-                    </div>
-                  </div>
-
-                  <div className="mb-3">
-                    <DepartmentToggles
-                      value={line.departments}
-                      onChange={(departments) => setLineField(lineIdx, "departments", departments)}
-                    />
-                  </div>
-
-                  {article?.addons?.length > 0 && (
-                    <div className="mb-3 rounded-xl p-3" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
-                      <div className="text-[11px] font-semibold uppercase tracking-wide mb-2" style={{ color: COLORS.goldDim }}>
-                        Add-ons
-                      </div>
-                      <div className="flex flex-wrap gap-3">
-                        {article.addons.map((addon) => {
-                          const id = addon.addon_id || addon.id;
-                          const checked = (line.addonIds || []).includes(id);
-                          const bits = [];
-                          if (addon.extra_selling_price != null || addon.sellingPrice != null) {
-                            bits.push(`+${formatPKR(addon.extra_selling_price ?? addon.sellingPrice)}`);
-                          }
-                          if (addon.addon_rate != null || addon.addonRate != null) {
-                            bits.push(`pay ${formatPKR(addon.addon_rate ?? addon.addonRate)}`);
-                          }
-                          return (
-                            <label key={id} className="flex items-center gap-2 text-[12px]" style={{ color: COLORS.ink }}>
-                              <input
-                                type="checkbox"
-                                checked={checked}
-                                onChange={(e) => {
-                                  const ids = line.addonIds || [];
-                                  setLineField(
-                                    lineIdx,
-                                    "addonIds",
-                                    e.target.checked ? [...ids, id] : ids.filter((x) => x !== id)
-                                  );
-                                }}
-                              />
-                              {addon.addon_name || addon.name}
-                              {bits.length ? ` (${bits.join(" · ")})` : ""}
-                            </label>
-                          );
-                        })}
-                      </div>
-                      <p className="text-[10.5px] mt-2" style={{ color: COLORS.graphiteLight }}>
-                        Only checked add-ons show in Daily Entry (work type + Cut→Sti→Button flow). Leave unchecked to skip.
-                      </p>
-                    </div>
-                  )}
-
-                  {article && (() => {
-                    const tip = calcArticleOrderSuggestion(article, null, line.departments, {
-                      addonIds: line.addonIds || [],
-                      orderPriceOverride: line.orderPriceOverride === "" ? null : line.orderPriceOverride,
-                    });
-                    if (!tip) return null;
-                    return (
-                      <div className="rounded-xl p-3 mb-3 space-y-1.5" style={{ background: COLORS.goldSoft, border: `1px solid ${COLORS.border}` }}>
-                        <div className="text-[11px] font-semibold uppercase tracking-wide" style={{ color: COLORS.goldDim }}>
-                          Price per piece (PPP)
-                        </div>
-                        <div className="flex justify-between text-[12px]" style={{ color: COLORS.graphite }}>
-                          <span>Labor (selected depts)</span>
-                          <span>
-                            {formatPKR(tip.activeLabor)}
-                            {tip.activeLabor !== tip.fullLabor && (
-                              <span className="ml-1 line-through opacity-60">{formatPKR(tip.fullLabor)}</span>
-                            )}
-                          </span>
-                        </div>
-                        <div className="flex justify-between text-[12px]" style={{ color: COLORS.graphite }}>
-                          <span>Target margin</span>
-                          <span>{tip.targetMarginPercent}%</span>
-                        </div>
-                        <div className="flex justify-between text-[13px] font-semibold" style={{ color: COLORS.ink }}>
-                          <span>Suggested PPP</span>
-                          <span style={line.orderPriceOverride !== "" ? { textDecoration: "line-through" } : undefined}>
-                            {formatPKR(tip.suggestedPpp)}
-                          </span>
-                        </div>
-                        <div>
-                          <label className="form-label">Your price / piece (optional)</label>
-                          <input
-                            type="number"
-                            min="0"
-                            className="form-input"
-                            value={line.orderPriceOverride || ""}
-                            onChange={(e) => setLineField(lineIdx, "orderPriceOverride", e.target.value)}
-                            placeholder="Leave empty for suggested"
-                          />
-                        </div>
-                        <div className="flex justify-between text-[12px]" style={{ color: COLORS.green }}>
-                          <span>Profit / pc · margin</span>
-                          <span>{formatPKR(tip.profit)} · {tip.realizedMarginPercent}%</span>
-                        </div>
-                      </div>
-                    );
-                  })()}
-
-                  <details className="mb-3">
-                    <summary className="text-[11px] font-semibold cursor-pointer select-none" style={{ color: COLORS.goldDim }}>
-                      Shipping details (optional)
-                    </summary>
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-2.5">
-                      <div>
-                        <label className="form-label">Net weight (kg)</label>
-                        <input type="number" className="form-input" value={line.netWeight} onChange={(e) => setLineField(lineIdx, "netWeight", e.target.value)} />
-                      </div>
-                      <div>
-                        <label className="form-label">Gross weight (kg)</label>
-                        <input type="number" className="form-input" value={line.grossWeight} onChange={(e) => setLineField(lineIdx, "grossWeight", e.target.value)} />
-                      </div>
-                      <div>
-                        <label className="form-label">Carton size</label>
-                        <input className="form-input" value={line.cartonSize} onChange={(e) => setLineField(lineIdx, "cartonSize", e.target.value)} placeholder="47x35x14" />
-                      </div>
-                      <div>
-                        <label className="form-label">CBM</label>
-                        <input type="number" className="form-input" value={line.cbm} onChange={(e) => setLineField(lineIdx, "cbm", e.target.value)} />
-                      </div>
-                    </div>
-                  </details>
-
-                  <div>
-                    <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
-                      <label className="form-label mb-0">Design / Color</label>
-                      <div className="flex items-center gap-2">
-                        {namedEntries.length > 1 && (
-                          <div className="flex items-center gap-1 text-[11px] font-semibold">
-                            <button type="button" className={line.splitMode === "equal" ? "btn-primary" : "btn-secondary"} style={{ padding: "3px 9px", borderRadius: 6, background: line.splitMode === "equal" ? COLORS.gold : COLORS.card, color: line.splitMode === "equal" ? COLORS.ink : COLORS.graphite, border: `1px solid ${COLORS.border}` }} onClick={() => setSplitMode(lineIdx, "equal")}>
-                              Equal split
-                            </button>
-                            <button type="button" className={line.splitMode === "custom" ? "btn-primary" : "btn-secondary"} style={{ padding: "3px 9px", borderRadius: 6, background: line.splitMode === "custom" ? COLORS.gold : COLORS.card, color: line.splitMode === "custom" ? COLORS.ink : COLORS.graphite, border: `1px solid ${COLORS.border}` }} onClick={() => setSplitMode(lineIdx, "custom")}>
-                              Custom split
-                            </button>
-                          </div>
-                        )}
-                        <button type="button" className="text-[11px] font-semibold px-2.5 py-1.5 rounded-lg" style={{ background: COLORS.goldSoft, color: COLORS.goldDim }} onClick={() => addDesignColor(lineIdx)}>
-                          + Add design / color
-                        </button>
-                      </div>
-                    </div>
-
-                    {designColors.length === 0 ? (
-                      <p className="text-[11px]" style={{ color: COLORS.graphiteLight }}>No design/color yet — add entries like &quot;Olive green&quot; or &quot;Sunflower yellow&quot;, then split quantity across them.</p>
-                    ) : (
-                      <div className="flex flex-col gap-1.5">
-                        {designColors.map((dc) => (
-                          <div key={dc.id} className="flex flex-wrap items-center gap-2 text-[12px] px-2.5 py-2 rounded-lg" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
-                            <input
-                              className="form-input flex-1 min-w-[140px]"
-                              value={dc.name}
-                              onChange={(e) => updateDesignColor(lineIdx, dc.id, "name", e.target.value)}
-                              placeholder="e.g. Olive green"
-                            />
-                            <input
-                              className="form-input"
-                              style={{ width: 130 }}
-                              value={dc.barcode}
-                              onChange={(e) => updateDesignColor(lineIdx, dc.id, "barcode", e.target.value)}
-                              placeholder="barcode (optional)"
-                            />
-                            {namedEntries.length > 1 ? (
-                              line.splitMode === "custom" ? (
-                                <input
-                                  type="number"
-                                  className="form-input text-right"
-                                  style={{ width: 84 }}
-                                  value={dc.quantity}
-                                  onChange={(e) => updateDesignColor(lineIdx, dc.id, "quantity", e.target.value)}
-                                  placeholder="qty"
-                                />
-                              ) : (
-                                <span className="text-[12px] font-semibold shrink-0" style={{ width: 84, textAlign: "right", color: COLORS.graphite }}>
-                                  {dc.name.trim() ? (equalPreview?.[dc.id] ?? 0).toLocaleString() : "—"}
-                                </span>
-                              )
-                            ) : (
-                              <span className="text-[12px] font-semibold shrink-0" style={{ width: 84, textAlign: "right", color: COLORS.graphite }}>
-                                {dc.name.trim() ? qty.toLocaleString() : "—"}
-                              </span>
-                            )}
-                            <button type="button" className="text-[11px] font-semibold shrink-0 px-2" style={{ color: COLORS.rust }} onClick={() => removeDesignColor(lineIdx, dc.id)} aria-label="Remove">
-                              Remove
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-
-                    {namedEntries.length > 1 && (
-                      <p className="text-[11px] mt-1.5" style={{ color: splitError ? COLORS.rust : COLORS.graphiteLight }}>
-                        {line.splitMode === "custom"
-                          ? `Split: ${customSum.toLocaleString()} / ${qty.toLocaleString()} needed`
-                          : "Quantity split evenly across design/color entries"}
-                      </p>
-                    )}
-                    {namedEntries.length === 1 && (
-                      <p className="text-[11px] mt-1.5" style={{ color: COLORS.graphiteLight }}>Full line quantity applies to this design/color.</p>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          <button type="button" className="btn-dashed mt-4 w-full justify-center py-3" onClick={addLine}>
-            <PlusIcon /> Add order line
-          </button>
-          </div>
-        </div>
-
-        <div className="sticky bottom-0 flex items-center justify-end gap-3 px-6 py-4" style={{ background: COLORS.card, borderTop: `1px solid ${COLORS.border}` }}>
-          <button type="button" className="btn-secondary text-[12.5px] font-medium px-4 py-2 rounded-lg" style={{ border: `1px solid ${COLORS.border}`, color: COLORS.graphite }} onClick={onClose}>
-            Cancel
-          </button>
-          <button
-            type="button"
-            className="btn-primary text-[12.5px] font-semibold px-4 py-2 rounded-lg"
-            style={{ background: isValid ? COLORS.gold : COLORS.boneBorder, color: isValid ? COLORS.ink : COLORS.graphiteLight, cursor: isValid && !isSaving ? "pointer" : "not-allowed" }}
-            onClick={handleSubmit}
-            disabled={!isValid || isSaving}
-          >
-            {isSaving ? "Saving…" : editingOrder ? "Save changes" : "Add order"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 export default function OrdersPage() {
   const { canWrite } = useAuth();
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -2111,7 +1638,6 @@ export default function OrdersPage() {
   const [statusFilter, setStatusFilter] = useState("All statuses");
   const [orders, setOrders] = useState([]);
   const [articles, setArticles] = useState([]);
-  const [sets, setSets] = useState([]);
   const [stationTotals, setStationTotals] = useState({});
   const [addonTotals, setAddonTotals] = useState({});
   const [isLoading, setIsLoading] = useState(true);
@@ -2129,24 +1655,20 @@ export default function OrdersPage() {
       setIsLoading(true);
       setLoadError("");
       try {
-        const [ordersRes, articlesRes, setsRes, totalsRes] = await Promise.all([
+        const [ordersRes, articlesRes, totalsRes] = await Promise.all([
           apiFetch("/api/orders"),
           apiFetch("/api/articles"),
-          apiFetch("/api/sets"),
           apiFetch("/api/production/station-totals"),
         ]);
         if (!ordersRes.ok) throw new Error(await readApiError(ordersRes, "Failed to load orders"));
         if (!articlesRes.ok) throw new Error(await readApiError(articlesRes, "Failed to load articles"));
-        if (!setsRes.ok) throw new Error(await readApiError(setsRes, "Failed to load sets"));
-        const [ordersData, articlesData, setsData] = await Promise.all([
+        const [ordersData, articlesData] = await Promise.all([
           ordersRes.json(),
           articlesRes.json(),
-          setsRes.json(),
         ]);
         if (cancelled) return;
         setOrders(Array.isArray(ordersData) ? ordersData : []);
-        setArticles(Array.isArray(articlesData) ? articlesData.map(articleToLegacy) : []);
-        setSets(Array.isArray(setsData) ? setsData : []);
+        setArticles(Array.isArray(articlesData) ? articlesData : []);
         if (totalsRes.ok) {
           const totalsData = await totalsRes.json();
           if (totalsData?.stations && typeof totalsData.stations === "object") {
@@ -2370,7 +1892,6 @@ export default function OrdersPage() {
       {canWrite && showAddModal && (
         <AddOrderModal
           articles={articles}
-          sets={sets}
           editingOrder={editingOrder}
           onClose={() => { setShowAddModal(false); setEditingOrder(null); }}
           onSave={handleSaveOrder}
