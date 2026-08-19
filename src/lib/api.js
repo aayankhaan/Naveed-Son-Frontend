@@ -1,4 +1,4 @@
-export const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:5000";
+export const API_BASE = import.meta.env.VITE_API_BASE_URL || "https://naveedandsons.online";
 
 const SESSION_KEY = "naveed-sons.session";
 
@@ -19,4 +19,3 @@ export function apiFetch(path, options = {}) {
     return response;
   });
 }
-
