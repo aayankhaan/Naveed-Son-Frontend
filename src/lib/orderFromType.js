@@ -1,6 +1,12 @@
 // Build order lines from Item Costing v2 (article → type → material × size)
 
-import { genId, partLabourTotal, companyRateAt, calcTypeLabourAtSize } from "./costingV2";
+import {
+  genId,
+  partLabourTotal,
+  companyRateAt,
+  calcTypeLabourAtSize,
+  resolvePackingOption,
+} from "./costingV2";
 import {
   buildVariantsFromDesignColors,
   buildPartVariantsFromSetOrder,
@@ -30,12 +36,14 @@ function labourForPart(type, part, sizeId) {
   return (part?.labourBySize && part.labourBySize[sizeId]) || part?.labour || {};
 }
 
-function packingForType(type, sizeId) {
-  const same = type.labourSameForAllSizes !== false;
-  const L = same
-    ? type.labour
-    : (type.labourBySize && type.labourBySize[sizeId]) || type.labour;
-  return Number(L?.packingRate) || 0;
+function packingSnapshot(type, packingOptionId) {
+  const opt = resolvePackingOption(type, packingOptionId);
+  return {
+    packingOptionId: opt?.id || packingOptionId || null,
+    packingOptionName: opt?.name || "Simple packing",
+    labourRate: Number(opt?.labourRate) || 0,
+    companyRate: Number(opt?.companyRate) || 0,
+  };
 }
 
 function snapshotAddons(type, addonIds) {
@@ -55,18 +63,18 @@ function snapshotAddons(type, addonIds) {
     }));
 }
 
-export function typeCompanyTotal(type, materialId, sizeId, addonIds) {
+export function typeCompanyTotal(type, materialId, sizeId, addonIds, packingOptionId = null) {
   const base = companyRateAt(type, materialId, sizeId);
+  const pack = packingSnapshot(type, packingOptionId);
   const extras = snapshotAddons(type, addonIds).reduce(
     (s, a) => s + (Number(a.companyRate) || 0),
     0
   );
-  return base + extras;
+  return base + pack.companyRate + extras;
 }
 
-export function typeLabourPreview(type, sizeId, addonIds) {
-  const labor = calcTypeLabourAtSize(type, sizeId);
-  // calcTypeLabourAtSize already includes all addons — adjust to selected only
+export function typeLabourPreview(type, sizeId, addonIds, packingOptionId = null) {
+  const labor = calcTypeLabourAtSize(type, sizeId, packingOptionId);
   const allAddon = (type.addons || []).reduce((s, a) => s + (Number(a.addonRate) || 0), 0);
   const selected = snapshotAddons(type, addonIds).reduce(
     (s, a) => s + (Number(a.addonRate) || 0),
@@ -78,7 +86,7 @@ export function typeLabourPreview(type, sizeId, addonIds) {
 /**
  * Flatten one type order block into API order lines.
  * Multi-part → one line per part (setId = typeId for Daily Entry grouping).
- * Packing rate stored once on first part + setPackingRate in meta.
+ * Packing labour from selected packing type; setPackingRate in meta.
  */
 export function flattenTypeOrderToLines(article, type, order) {
   const materialId = order.materialId;
@@ -97,13 +105,15 @@ export function flattenTypeOrderToLines(article, type, order) {
   };
   const addonIds = order.addonIds || [];
   const addons = snapshotAddons(type, addonIds);
-  const companyPerSet = typeCompanyTotal(type, materialId, sizeId, addonIds);
+  const packingOptionId = order.packingOptionId || type.packingOptions?.[0]?.id || null;
+  const pack = packingSnapshot(type, packingOptionId);
+  const companyPerSet = typeCompanyTotal(type, materialId, sizeId, addonIds, packingOptionId);
   const override =
     order.orderPriceOverride === "" || order.orderPriceOverride == null
       ? null
       : Number(order.orderPriceOverride);
   const sellPerSet = override != null && Number.isFinite(override) ? override : companyPerSet;
-  const setPacking = packingForType(type, sizeId);
+  const setPacking = pack.labourRate;
   const groupId = order.groupId || genId("GRP");
   const setName = `${article.name} · ${type.name}`;
   const designColors = order.designColors || [];
@@ -113,9 +123,7 @@ export function flattenTypeOrderToLines(article, type, order) {
 
   const sharedMeta = {
     groupId,
-    ...(isMultiPart
-      ? { setId: type.id, setName }
-      : {}),
+    ...(isMultiPart ? { setId: type.id, setName } : {}),
     typeId: type.id,
     typeName: type.name,
     articleId: article.id,
@@ -132,8 +140,11 @@ export function flattenTypeOrderToLines(article, type, order) {
     addonIds,
     addons,
     departments,
-    setPackingRate: isMultiPart ? setPacking : undefined,
-    setSellingPerUnit: companyPerSet,
+    packingOptionId: pack.packingOptionId,
+    packingOptionName: pack.packingOptionName,
+    packingCompanyRate: pack.companyRate,
+    setPackingRate: setPacking,
+    setSellingPerUnit: sellPerSet,
     suggestedSellingPerUnit: companyPerSet,
     ...(override != null && Number.isFinite(override) ? { orderPriceOverride: override } : {}),
     typeNote: type.description || "",
@@ -157,7 +168,7 @@ export function flattenTypeOrderToLines(article, type, order) {
         cutting_rate: Number(L.cuttingRate) || 0,
         stitching_rate: Number(L.stitchingRate) || 0,
         checking_rate: Number(L.checkingRate) || 0,
-        packing_rate: Number(L.packingRate) || 0,
+        packing_rate: setPacking,
         skip_cutting: !departments.cutting,
         skip_stitching: !departments.stitching,
         skip_checking: !departments.checking,
@@ -172,7 +183,7 @@ export function flattenTypeOrderToLines(article, type, order) {
             cuttingRate: Number(L.cuttingRate) || 0,
             stitchingRate: Number(L.stitchingRate) || 0,
             checkingRate: Number(L.checkingRate) || 0,
-            packingRate: Number(L.packingRate) || 0,
+            packingRate: setPacking,
           },
         },
       },
@@ -251,6 +262,7 @@ export function emptyTypeBlock(articles) {
     typeId: type?.id || "",
     materialId: type?.materials?.[0]?.id || "",
     sizeId: type?.sizes?.[0]?.id || "",
+    packingOptionId: type?.packingOptions?.[0]?.id || "",
     measurement: "",
     orderQuantity: 1,
     packPerCtn: 6,

@@ -1,4 +1,4 @@
-// Pricing helpers for Item Costing v2 (type × material × size + parts labour + addons)
+// Pricing helpers for Item Costing v2 (type × material × size + parts labour + packing options + addons)
 
 export function formatPKR(n) {
   const v = Number(n) || 0;
@@ -13,7 +13,16 @@ export function emptyLabour() {
   return { cuttingRate: "", stitchingRate: "", checkingRate: "", packingRate: "" };
 }
 
-/** Cut + Stitch + Check only (packing is set-level) */
+export function emptyPackingOption() {
+  return {
+    id: genId("PACK"),
+    name: "",
+    labourRate: "",
+    companyRate: "",
+  };
+}
+
+/** Cut + Stitch + Check only (packing is set-level options) */
 export function partLabourTotal(labour) {
   if (!labour) return 0;
   return (
@@ -28,20 +37,37 @@ export function labourTotal(labour) {
   return partLabourTotal(labour) + (Number(labour.packingRate) || 0);
 }
 
-function packingAtSize(type, sizeId) {
-  const same = type.labourSameForAllSizes !== false;
-  const L = same
-    ? type.labour
-    : (type.labourBySize && type.labourBySize[sizeId]) || type.labour;
-  return Number(L?.packingRate) || 0;
+export function resolvePackingOption(type, packingOptionId) {
+  const list = type?.packingOptions || [];
+  if (!list.length) {
+    // Legacy fallback from type.labour.packingRate
+    const rate = Number(type?.labour?.packingRate) || 0;
+    if (!rate) return null;
+    return { id: null, name: "Simple packing", labourRate: rate, companyRate: 0 };
+  }
+  if (packingOptionId) {
+    const found = list.find((p) => p.id === packingOptionId);
+    if (found) return found;
+  }
+  return list[0];
+}
+
+function packingLabourOf(type, packingOptionId) {
+  const opt = resolvePackingOption(type, packingOptionId);
+  return Number(opt?.labourRate) || 0;
+}
+
+function packingCompanyOf(type, packingOptionId) {
+  const opt = resolvePackingOption(type, packingOptionId);
+  return Number(opt?.companyRate) || 0;
 }
 
 /**
  * Labour for one complete set/unit at a size:
- * - no parts → all 4 stations on type
- * - with parts → (Cut+Stitch+Check)×qty per part + Packing 1× on type
+ * - no parts → Cut/Stitch/Check on type + packing option labour
+ * - with parts → (Cut+Stitch+Check)×qty per part + packing option labour 1×
  */
-export function calcTypeLabourAtSize(type, sizeId) {
+export function calcTypeLabourAtSize(type, sizeId, packingOptionId = null) {
   const same = type.labourSameForAllSizes !== false;
   const parts = type.parts || [];
   let total = 0;
@@ -50,7 +76,7 @@ export function calcTypeLabourAtSize(type, sizeId) {
     const L = same
       ? type.labour
       : (type.labourBySize && type.labourBySize[sizeId]) || type.labour;
-    total += labourTotal(L);
+    total += partLabourTotal(L);
   } else {
     for (const part of parts) {
       const qty = Number(part.qtyBySize?.[sizeId] ?? 1) || 0;
@@ -59,8 +85,9 @@ export function calcTypeLabourAtSize(type, sizeId) {
         : (part.labourBySize && part.labourBySize[sizeId]) || part.labour;
       total += partLabourTotal(L) * qty;
     }
-    total += packingAtSize(type, sizeId);
   }
+
+  total += packingLabourOf(type, packingOptionId);
 
   for (const a of type.addons || []) {
     total += Number(a.addonRate) || 0;
@@ -75,11 +102,12 @@ export function companyRateAt(type, materialId, sizeId) {
   return Number(row?.companyRate) || 0;
 }
 
-export function calcTypeSummary(type, materialId, sizeId) {
+export function calcTypeSummary(type, materialId, sizeId, packingOptionId = null) {
   const company =
     companyRateAt(type, materialId, sizeId) +
+    packingCompanyOf(type, packingOptionId) +
     (type.addons || []).reduce((s, a) => s + (Number(a.companyRate) || 0), 0);
-  const labor = calcTypeLabourAtSize(type, sizeId);
+  const labor = calcTypeLabourAtSize(type, sizeId, packingOptionId);
   const profit = company - labor;
   const margin = company > 0 ? Number(((profit / company) * 100).toFixed(1)) : 0;
   return { company, labor, profit, margin };
@@ -96,6 +124,9 @@ export function emptyTypeDraft() {
     parts: [],
     labour: emptyLabour(),
     labourBySize: {},
+    packingOptions: [
+      { id: genId("PACK"), name: "Simple packing", labourRate: "", companyRate: "" },
+    ],
     addons: [],
   };
 }

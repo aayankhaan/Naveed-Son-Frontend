@@ -31,12 +31,13 @@ function TypeBlockCard({ block, articles, onChange, onRemove, canRemove }) {
   const sizes = type?.sizes || [];
   const parts = type?.parts || [];
   const addons = type?.addons || [];
+  const packingOptions = type?.packingOptions || [];
 
   const company = type && block.materialId && block.sizeId
-    ? typeCompanyTotal(type, block.materialId, block.sizeId, block.addonIds)
+    ? typeCompanyTotal(type, block.materialId, block.sizeId, block.addonIds, block.packingOptionId)
     : 0;
   const labor = type && block.sizeId
-    ? typeLabourPreview(type, block.sizeId, block.addonIds)
+    ? typeLabourPreview(type, block.sizeId, block.addonIds, block.packingOptionId)
     : 0;
   const override =
     block.orderPriceOverride === "" || block.orderPriceOverride == null
@@ -62,6 +63,7 @@ function TypeBlockCard({ block, articles, onChange, onRemove, canRemove }) {
       typeId: t?.id || "",
       materialId: t?.materials?.[0]?.id || "",
       sizeId: t?.sizes?.[0]?.id || "",
+      packingOptionId: t?.packingOptions?.[0]?.id || "",
       addonIds: [],
       measurement: "",
     });
@@ -73,6 +75,7 @@ function TypeBlockCard({ block, articles, onChange, onRemove, canRemove }) {
       typeId,
       materialId: t?.materials?.[0]?.id || "",
       sizeId: t?.sizes?.[0]?.id || "",
+      packingOptionId: t?.packingOptions?.[0]?.id || "",
       addonIds: [],
     });
   }
@@ -205,6 +208,26 @@ function TypeBlockCard({ block, articles, onChange, onRemove, canRemove }) {
                   ))}
                 </select>
               </div>
+
+              {packingOptions.length > 0 && (
+                <div>
+                  <label className="form-label">Packing type</label>
+                  <select
+                    className="form-input max-w-md"
+                    value={block.packingOptionId || packingOptions[0]?.id || ""}
+                    onChange={(e) => patch({ packingOptionId: e.target.value })}
+                  >
+                    {packingOptions.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name || "Packing"} — labour {formatPKR(p.labourRate)} · company {formatPKR(p.companyRate)}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-[10.5px] mt-1" style={{ color: COLORS.graphiteLight }}>
+                    Labour paid 1× per set; company sell added to price
+                  </p>
+                </div>
+              )}
 
               {parts.length > 0 && (
                 <div className="text-[12px]" style={{ color: COLORS.graphite }}>
@@ -546,6 +569,7 @@ export function typeBlocksFromOrder(order, articles) {
       typeId,
       materialId: meta.materialId || "",
       sizeId: meta.sizeId || "",
+      packingOptionId: meta.packingOptionId || "",
       measurement: meta.measurement || meta.sizeText || first.dimension_name || "",
       orderQuantity: meta.orderQuantity || Math.max(1, Number(first.quantity) || 1),
       packPerCtn: first.pack_per_ctn || 6,

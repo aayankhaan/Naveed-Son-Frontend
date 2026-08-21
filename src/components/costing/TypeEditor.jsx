@@ -5,9 +5,9 @@ import {
   calcTypeSummary,
   emptyAddonDraft,
   emptyLabour,
+  emptyPackingOption,
   formatPKR,
   genId,
-  labourTotal,
   partLabourTotal,
 } from "../../lib/costingV2";
 
@@ -129,7 +129,6 @@ function LabourFields({ labour, onChange, stations = STATION_ORDER }) {
 }
 
 const PART_STATIONS = ["Cutting", "Stitching", "Checking"];
-const PACK_STATIONS = ["Packing"];
 
 function QtyBySizeRow({ sizes, qtyBySize, onChange }) {
   if (!sizes.length) return null;
@@ -230,6 +229,9 @@ export default function TypeEditor({ initialType, articleName, onSave, onCancel 
     sizes: initialType.sizes || [],
     companyRates: initialType.companyRates || [],
     parts: initialType.parts || [],
+    packingOptions: initialType.packingOptions?.length
+      ? initialType.packingOptions
+      : [emptyPackingOption()],
     addons: initialType.addons || [],
     labourSameForAllSizes: initialType.labourSameForAllSizes !== false,
   }));
@@ -239,6 +241,9 @@ export default function TypeEditor({ initialType, articleName, onSave, onCancel 
     () => initialType.materials?.[0]?.id || ""
   );
   const [previewSizeId, setPreviewSizeId] = useState(() => initialType.sizes?.[0]?.id || "");
+  const [previewPackingId, setPreviewPackingId] = useState(
+    () => initialType.packingOptions?.[0]?.id || ""
+  );
 
   const materials = type.materials;
   const sizes = type.sizes;
@@ -247,8 +252,9 @@ export default function TypeEditor({ initialType, articleName, onSave, onCancel 
     const mid = previewMaterialId || materials[0]?.id;
     const sid = previewSizeId || sizes[0]?.id;
     if (!mid || !sid) return null;
-    return calcTypeSummary(type, mid, sid);
-  }, [type, previewMaterialId, previewSizeId, materials, sizes]);
+    const pid = previewPackingId || type.packingOptions?.[0]?.id || null;
+    return calcTypeSummary(type, mid, sid, pid);
+  }, [type, previewMaterialId, previewSizeId, previewPackingId, materials, sizes]);
 
   function patch(partial) {
     setType((prev) => ({ ...prev, ...partial }));
@@ -315,6 +321,20 @@ export default function TypeEditor({ initialType, articleName, onSave, onCancel 
     patch({ addons: type.addons.map((a) => (a.id === id ? { ...a, ...partial } : a)) });
   }
 
+  function updatePacking(id, partial) {
+    patch({
+      packingOptions: (type.packingOptions || []).map((p) =>
+        p.id === id ? { ...p, ...partial } : p
+      ),
+    });
+  }
+
+  function removePacking(id) {
+    const next = (type.packingOptions || []).filter((p) => p.id !== id);
+    patch({ packingOptions: next.length ? next : [emptyPackingOption()] });
+    if (previewPackingId === id) setPreviewPackingId(next[0]?.id || "");
+  }
+
   async function handleSubmit(e) {
     e.preventDefault();
     if (!type.name.trim()) {
@@ -330,6 +350,7 @@ export default function TypeEditor({ initialType, articleName, onSave, onCancel 
         description: (type.description || "").trim(),
         companyRates: syncCompanyRates(type, materials, sizes),
         parts: syncPartQtys(type.parts, sizes).filter((p) => p.name.trim()),
+        packingOptions: (type.packingOptions || []).filter((p) => String(p.name || "").trim()),
       });
     } catch (err) {
       setError(err?.message || "Could not save");
@@ -484,13 +505,19 @@ export default function TypeEditor({ initialType, articleName, onSave, onCancel 
                 <>
                   <div className="flex items-baseline justify-between mb-2">
                     <span className="text-[10.5px] font-semibold uppercase tracking-wide" style={{ color: COLORS.graphite }}>
-                      Wages / pc
+                      Cut / Stitch / Check / pc
                     </span>
                     <span className="text-[11px]" style={{ color: COLORS.graphiteLight }}>
-                      {formatPKR(labourTotal(type.labour))}
+                      {formatPKR(partLabourTotal(type.labour))}
                     </span>
                   </div>
-                  <LabourFields labour={type.labour} onChange={(labour) => patch({ labour })} />
+                  <LabourFields
+                    stations={PART_STATIONS}
+                    labour={type.labour}
+                    onChange={(labour) =>
+                      patch({ labour: { ...labour, packingRate: 0 } })
+                    }
+                  />
                 </>
               ) : sizes.length ? (
                 <div className="space-y-4">
@@ -499,13 +526,19 @@ export default function TypeEditor({ initialType, articleName, onSave, onCancel 
                       <div className="flex items-baseline justify-between mb-2">
                         <span className="text-[12px] font-medium" style={{ color: COLORS.ink }}>{s.name}</span>
                         <span className="text-[11px]" style={{ color: COLORS.graphiteLight }}>
-                          {formatPKR(labourTotal(type.labourBySize?.[s.id]))}
+                          {formatPKR(partLabourTotal(type.labourBySize?.[s.id]))}
                         </span>
                       </div>
                       <LabourFields
+                        stations={PART_STATIONS}
                         labour={type.labourBySize?.[s.id] || emptyLabour()}
                         onChange={(labour) =>
-                          patch({ labourBySize: { ...type.labourBySize, [s.id]: labour } })
+                          patch({
+                            labourBySize: {
+                              ...type.labourBySize,
+                              [s.id]: { ...labour, packingRate: 0 },
+                            },
+                          })
                         }
                       />
                     </div>
@@ -608,80 +641,86 @@ export default function TypeEditor({ initialType, articleName, onSave, onCancel 
                   )}
                 </div>
               ))}
-
-              {/* Packing = 1× for whole set */}
-              <div
-                className="rounded-xl p-4"
-                style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}
-              >
-                <div className="flex items-baseline justify-between mb-2">
-                  <div>
-                    <div className="text-[13px] font-semibold" style={{ color: COLORS.ink }}>
-                      Packing (whole set)
-                    </div>
-                    <p className="text-[11.5px] mt-0.5" style={{ color: COLORS.graphiteLight }}>
-                      Once per set — not per part
-                    </p>
-                  </div>
-                  <span className="text-[11px]" style={{ color: COLORS.graphiteLight }}>
-                    {formatPKR(
-                      Number(
-                        type.labourSameForAllSizes
-                          ? type.labour?.packingRate
-                          : type.labourBySize?.[sizes[0]?.id]?.packingRate
-                      ) || 0
-                    )}
-                  </span>
-                </div>
-                {type.labourSameForAllSizes ? (
-                  <LabourFields
-                    stations={PACK_STATIONS}
-                    labour={type.labour}
-                    onChange={(labour) =>
-                      patch({
-                        labour: {
-                          ...type.labour,
-                          packingRate: labour.packingRate,
-                          cuttingRate: 0,
-                          stitchingRate: 0,
-                          checkingRate: 0,
-                        },
-                      })
-                    }
-                  />
-                ) : sizes.length ? (
-                  <div className="space-y-3">
-                    {sizes.map((s) => (
-                      <div key={s.id}>
-                        <div className="text-[12px] font-medium mb-1.5" style={{ color: COLORS.graphite }}>
-                          {s.name}
-                        </div>
-                        <LabourFields
-                          stations={PACK_STATIONS}
-                          labour={type.labourBySize?.[s.id] || emptyLabour()}
-                          onChange={(labour) =>
-                            patch({
-                              labourBySize: {
-                                ...type.labourBySize,
-                                [s.id]: {
-                                  cuttingRate: 0,
-                                  stitchingRate: 0,
-                                  checkingRate: 0,
-                                  packingRate: labour.packingRate,
-                                },
-                              },
-                            })
-                          }
-                        />
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="text-[12px]" style={{ color: COLORS.graphiteLight }}>Add sizes first.</p>
-                )}
-              </div>
             </div>
           )}
+        </Block>
+
+        <Block
+          title="Packing types"
+          action={
+            <LinkBtn
+              onClick={() =>
+                patch({
+                  packingOptions: [...(type.packingOptions || []), emptyPackingOption()],
+                })
+              }
+            >
+              + Packing type
+            </LinkBtn>
+          }
+        >
+          <p className="text-[12px] mb-3" style={{ color: COLORS.graphiteLight }}>
+            Each packing style has labour (worker pay, 1× set) and company sell for that packing.
+            Old packing rates migrate to “Simple packing” — nothing is deleted.
+          </p>
+          <div className="space-y-3">
+            {(type.packingOptions || []).map((opt, idx) => (
+              <div
+                key={opt.id}
+                className="rounded-xl p-4"
+                style={{ background: COLORS.boneDim }}
+              >
+                <div className="flex items-center gap-2 mb-3">
+                  <span
+                    className="text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0"
+                    style={{ background: COLORS.goldSoft, color: COLORS.goldDim }}
+                  >
+                    {idx + 1}
+                  </span>
+                  <input
+                    className="form-input flex-1 min-w-0"
+                    value={opt.name}
+                    onChange={(e) => updatePacking(opt.id, { name: e.target.value })}
+                    placeholder="Simple packing / Gift box / …"
+                  />
+                  <button
+                    type="button"
+                    className="text-[12px] font-medium shrink-0 px-1"
+                    style={{ color: COLORS.rust }}
+                    onClick={() => removePacking(opt.id)}
+                  >
+                    Remove
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="form-label">Labour (worker)</label>
+                    <input
+                      className="form-input"
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      value={opt.labourRate ?? ""}
+                      onChange={(e) => updatePacking(opt.id, { labourRate: e.target.value })}
+                      placeholder="0"
+                    />
+                  </div>
+                  <div>
+                    <label className="form-label">Company sell</label>
+                    <input
+                      className="form-input"
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      value={opt.companyRate ?? ""}
+                      onChange={(e) => updatePacking(opt.id, { companyRate: e.target.value })}
+                      placeholder="0"
+                    />
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
         </Block>
 
         <Block
@@ -866,6 +905,17 @@ export default function TypeEditor({ initialType, articleName, onSave, onCancel 
                 <option key={s.id} value={s.id}>{s.name}</option>
               ))}
             </select>
+            {(type.packingOptions || []).length > 0 && (
+              <select
+                className="form-input w-auto py-1.5 text-[12px]"
+                value={previewPackingId || type.packingOptions[0]?.id}
+                onChange={(e) => setPreviewPackingId(e.target.value)}
+              >
+                {type.packingOptions.map((p) => (
+                  <option key={p.id} value={p.id}>{p.name || "Packing"}</option>
+                ))}
+              </select>
+            )}
             <span style={{ color: COLORS.graphite }}>
               Co <strong style={{ color: COLORS.ink }}>{formatPKR(summary.company)}</strong>
             </span>
